@@ -6,7 +6,9 @@
 // agent is doing.
 //
 // State lives in <project>/.agentchat/ so it is shared by all sessions on
-// the project and survives restarts.
+// the project and survives restarts. See docs/MAINTENANCE.md for the state
+// schema and the opencode integration surface that must be re-checked on
+// every opencode upgrade.
 
 import * as fs from "node:fs"
 import * as path from "node:path"
@@ -22,10 +24,12 @@ type AgentRecord = {
   status: string
   statusAt: number
   registeredAt: number
+  /** roomId -> absolute message count already seen (see docs/MAINTENANCE.md) */
   reads: Record<string, number>
 }
 
 type Message = {
+  /** absolute index across the room's full sequence, survives trimming */
   i: number
   ts: number
   from: string
@@ -38,6 +42,8 @@ type Room = {
   purpose: string
   createdBy: string
   createdAt: number
+  /** absolute index of messages[0]; everything below it was trimmed away */
+  first: number
   members: string[]
   invites: string[]
   messages: Message[]
@@ -45,28 +51,37 @@ type Room = {
 
 const NAME_RE = /^[A-Za-z0-9_-]{1,32}$/
 const MAX_MESSAGES = 1000
+const MAX_ACTIVITY = 200
 
-export default (async ({ worktree }: { worktree: string }) => {
+export default (async ({ client, worktree }: { client: any; worktree: string }) => {
   const root = path.join(worktree, ".agentchat")
   const roomsDir = path.join(root, "rooms")
 
   // In-memory activity log, fed by tool.execute.before. Keyed by sessionID.
   const activity = new Map<string, { tool: string; ts: number }>()
 
-  const ensureDirs = () => {
-    fs.mkdirSync(roomsDir, { recursive: true })
-  }
+ // Sessions confirmed gone; dead sessions stay dead, so this is cacheable.
+  const deadCache = new Set<string>()
 
   const readJSON = <T,>(file: string, fallback: T): T => {
+    let raw: string
     try {
-      return JSON.parse(fs.readFileSync(file, "utf8")) as T
+      raw = fs.readFileSync(file, "utf8")
     } catch {
+      return fallback
+    }
+    try {
+      return JSON.parse(raw) as T
+    } catch {
+      try {
+        fs.renameSync(file, `${file}.corrupt-${Date.now()}`)
+      } catch {}
       return fallback
     }
   }
 
   const writeJSON = (file: string, data: unknown) => {
-    ensureDirs()
+    fs.mkdirSync(path.dirname(file), { recursive: true })
     const tmp = `${file}.${process.pid}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2))
     fs.renameSync(tmp, file)
@@ -76,7 +91,14 @@ export default (async ({ worktree }: { worktree: string }) => {
 
   const loadAgents = (): Record<string, AgentRecord> => readJSON(agentsFile(), {})
 
-  const saveAgents = (agents: Record<string, AgentRecord>) => writeJSON(agentsFile(), agents)
+  // Merge-by-sessionID so concurrent writers (multiple opencode processes
+  // on one worktree) cannot clobber each other's records.
+  const saveRecord = (rec: AgentRecord): AgentRecord => {
+    const agents = loadAgents()
+    agents[rec.sessionID] = rec
+    writeJSON(agentsFile(), agents)
+    return rec
+  }
 
   const takenNames = (agents: Record<string, AgentRecord>): Set<string> =>
     new Set(Object.values(agents).map((a) => a.name))
@@ -89,10 +111,11 @@ export default (async ({ worktree }: { worktree: string }) => {
     const existing = agents[ctx.sessionID]
     if (existing) return existing
     const taken = takenNames(agents)
-    let name = `${sanitize(ctx.agent)}-${ctx.sessionID.slice(-4)}`
+    const base = `${sanitize(ctx.agent)}-${ctx.sessionID.slice(-4)}`
+    let name = base
     let n = 2
-    while (taken.has(name)) name = `${sanitize(ctx.agent)}-${ctx.sessionID.slice(-4)}-${n++}`
-    const rec: AgentRecord = {
+    while (taken.has(name)) name = `${base}-${n++}`
+    return saveRecord({
       sessionID: ctx.sessionID,
       name,
       agent: ctx.agent,
@@ -100,18 +123,36 @@ export default (async ({ worktree }: { worktree: string }) => {
       statusAt: 0,
       registeredAt: Date.now(),
       reads: {},
-    }
-    agents[ctx.sessionID] = rec
-    saveAgents(agents)
-    return rec
+    })
   }
 
-  const findByName = (name: string): AgentRecord | undefined =>
-    Object.values(loadAgents()).find((a) => a.name === name)
+  const sessionAlive = async (sessionID: string): Promise<boolean> => {
+    if (deadCache.has(sessionID)) return false
+    try {
+      const res = await client.session.get({ path: { id: sessionID } })
+      if (res?.error || !res?.data) {
+        deadCache.add(sessionID)
+        return false
+      }
+    } catch {
+      // server unreachable — fail open
+    }
+    return true
+  }
 
   const roomFile = (id: string) => path.join(roomsDir, `${id}.json`)
 
-  const loadRoom = (id: string): Room | undefined => {
+  const normalizeRoom = (r: Room | undefined): Room | undefined => {
+    if (!r || !r.id) return undefined
+    r.first = typeof r.first === "number" ? r.first : 0
+    r.members ??= []
+    r.invites ??= []
+    r.messages ??= []
+    return r
+  }
+
+  const loadRoom = (id: string): Room | undefined => normalizeRoom(loadRoomRaw(id))
+  function loadRoomRaw(id: string): Room | undefined {
     try {
       return readJSON<Room>(roomFile(id), undefined as unknown as Room)
     } catch {
@@ -119,15 +160,44 @@ export default (async ({ worktree }: { worktree: string }) => {
     }
   }
 
-  const saveRoom = (room: Room) => writeJSON(roomFile(room.id), room)
+  const trimRoom = (room: Room) => {
+    if (room.messages.length > MAX_MESSAGES) {
+      const cut = room.messages.length - MAX_MESSAGES
+      room.messages.splice(0, cut)
+      room.first += cut
+    }
+  }
+
+  const pushMessage = (room: Room, from: string, text: string): Message => {
+    const m: Message = {
+      i: room.first + room.messages.length,
+      ts: Date.now(),
+      from,
+      text: text.trim().slice(0, 4000),
+    }
+    room.messages.push(m)
+    trimRoom(room)
+    return m
+  }
+
+  // Reload from disk before mutating so concurrent processes don't lose
+  // messages or membership changes.
+  const mutateRoom = (id: string, fn: (room: Room) => void): Room | undefined => {
+    const fresh = loadRoom(id)
+    if (!fresh) return undefined
+    fn(fresh)
+    trimRoom(fresh)
+    writeJSON(roomFile(id), fresh)
+    return fresh
+  }
 
   const allRooms = (): Room[] => {
     try {
       return fs
         .readdirSync(roomsDir)
         .filter((f) => f.endsWith(".json"))
-        .map((f) => readJSON<Room>(path.join(roomsDir, f), undefined as unknown as Room))
-        .filter((r) => r && r.id)
+        .map((f) => normalizeRoom(readJSON<Room>(path.join(roomsDir, f), undefined as unknown as Room)))
+        .filter((r): r is Room => !!r)
     } catch {
       return []
     }
@@ -170,8 +240,22 @@ export default (async ({ worktree }: { worktree: string }) => {
 
   const msgLine = (room: Room, m: Message) => `#${room.id} [${clock(m.ts)}] ${m.from}: ${m.text}`
 
-  const unreadFor = (rec: AgentRecord, room: Room): number =>
-    room.messages.length - (rec.reads[room.id] ?? 0)
+  const roomTotal = (room: Room) => room.first + room.messages.length
+
+  const unseenFor = (rec: AgentRecord, room: Room): Message[] => {
+    const cursor = Math.min(rec.reads[room.id] ?? 0, roomTotal(room))
+    const start = Math.max(0, cursor - room.first)
+    return room.messages.slice(start)
+  }
+
+  const markRead = (rec: AgentRecord, room: Room): AgentRecord => {
+    const agents = loadAgents()
+    const mine = agents[rec.sessionID] ?? rec
+    mine.reads[room.id] = roomTotal(room)
+    return saveRecord(mine)
+  }
+
+  const unreadCount = (rec: AgentRecord, room: Room): number => unseenFor(rec, room).length
 
   // ---------------------------------------------------------------- tools
 
@@ -179,7 +263,8 @@ export default (async ({ worktree }: { worktree: string }) => {
     description:
       "Set your unique chat name (agents/subagents each have one; yours was auto-assigned on first chat tool use). " +
       "Call with no args to see your current identity. Call with `name` to claim a unique, memorable name " +
-      "(letters, digits, dash, underscore, max 32). Other agents address you by this name in invites.",
+      "(letters, digits, dash, underscore, max 32; names held by exited sessions can be reclaimed). " +
+      "Other agents address you by this name in invites.",
     args: {
       name: z.string().optional().describe("New unique chat name for this agent"),
     },
@@ -198,63 +283,82 @@ export default (async ({ worktree }: { worktree: string }) => {
       if (!NAME_RE.test(name)) {
         return `Invalid name "${args.name}". Use 1-32 chars: letters, digits, dash, underscore.`
       }
+      if (rec.name === name) return `You are already named "${name}".`
       const agents = loadAgents()
-      if (takenNames(agents).has(name) && rec.name !== name) {
-        return `Name "${name}" is already taken by another agent. Pick another (see chat_agents).`
-      }
-      if (rec.name !== name) {
-        const old = rec.name
-        rec.name = name
-        agents[ctx.sessionID] = rec
-        saveAgents(agents)
+      const holder = Object.values(agents).find((a) => a.name === name && a.sessionID !== ctx.sessionID)
+      if (holder) {
+        if (await sessionAlive(holder.sessionID)) {
+          return `Name "${name}" is already taken by another active agent. Pick another (see chat_agents).`
+        }
+        const fresh = loadAgents()
+        if (fresh[holder.sessionID]) {
+          delete fresh[holder.sessionID]
+          writeJSON(agentsFile(), fresh)
+        }
         for (const room of allRooms()) {
           let dirty = false
-          if (room.members.includes(old)) {
-            room.members = room.members.map((m) => (m === old ? name : m))
+          if (room.members.includes(name)) {
+            room.members = room.members.filter((m) => m !== name)
             dirty = true
           }
-          if (room.invites.includes(old)) {
-            room.invites = room.invites.map((m) => (m === old ? name : m))
+          if (room.invites.includes(name)) {
+            room.invites = room.invites.filter((m) => m !== name)
             dirty = true
           }
-          if (dirty) saveRoom(room)
+          if (dirty) writeJSON(roomFile(room.id), room)
         }
-        return `Renamed "${old}" -> "${name}". Room memberships carried over; old names remain in message history.`
       }
-      return `You are already named "${name}".`
+      const old = rec.name
+      rec.name = name
+      saveRecord(rec)
+      for (const room of allRooms()) {
+        let dirty = false
+        if (room.members.includes(old)) {
+          room.members = room.members.map((m) => (m === old ? name : m))
+          dirty = true
+        }
+        if (room.invites.includes(old)) {
+          room.invites = room.invites.map((m) => (m === old ? name : m))
+          dirty = true
+        }
+        if (dirty) writeJSON(roomFile(room.id), room)
+      }
+      return `Renamed "${old}" -> "${name}". Room memberships carried over; old names remain in message history.`
     },
   })
 
   const chat_agents = tool({
     description:
-      "List every agent/subagent currently participating in agentchat: unique name, agent type, " +
+      "List every agent/subagent in this project's agentchat directory: unique name, agent type, " +
       "what it is doing (its status summary), its most recent activity, and which rooms it is in. " +
       "Use this to find who to invite to a room or who to ask for help.",
     args: {},
     execute: async (_args, ctx) => {
       const me = ensureAgent(ctx)
-      const agents = loadAgents()
-      const list = Object.values(agents).sort((a, b) => a.name.localeCompare(b.name))
+      const list = Object.values(loadAgents()).sort((a, b) => a.name.localeCompare(b.name))
       if (list.length === 1) {
         return [
           `You are the only agent registered so far: "${me.name}" (type ${me.agent}).`,
           "Other agents appear here as soon as they use any chat tool.",
         ].join("\n")
       }
-      return list
-        .map((a) => {
-          const act = activity.get(a.sessionID)
-          const doing =
-            a.status || (act ? `active (last tool: ${act.tool}, ${ago(act.ts)})` : "idle")
-          const rooms = roomsFor(a.name).map((r) => r.id)
-          return [
-            `- ${a.name}${a.sessionID === me.sessionID ? " (you)" : ""} [type: ${a.agent}]`,
+      const lines: string[] = []
+      for (const a of list) {
+        const alive = await sessionAlive(a.sessionID)
+        const act = activity.get(a.sessionID)
+        const doing =
+          a.status || (act ? `active (last tool: ${act.tool}, ${ago(act.ts)})` : alive ? "idle" : "exited")
+        const rooms = roomsFor(a.name).map((r) => r.id)
+        lines.push(
+          [
+            `- ${a.name}${a.sessionID === me.sessionID ? " (you)" : ""} [type: ${a.agent}]${alive ? "" : " [exited]"}`,
             `  doing: ${doing}`,
             `  last seen: ${ago(Math.max(a.statusAt, act?.ts ?? 0))}`,
             `  rooms: ${rooms.length ? rooms.join(", ") : "(none)"}`,
-          ].join("\n")
-        })
-        .join("\n")
+          ].join("\n"),
+        )
+      }
+      return lines.join("\n")
     },
   })
 
@@ -267,11 +371,9 @@ export default (async ({ worktree }: { worktree: string }) => {
     },
     execute: async (args, ctx) => {
       const rec = ensureAgent(ctx)
-      const agents = loadAgents()
       rec.status = args.status.trim().slice(0, 200)
       rec.statusAt = Date.now()
-      agents[ctx.sessionID] = rec
-      saveAgents(agents)
+      saveRecord(rec)
       return `Status updated: "${rec.status}"`
     },
   })
@@ -279,11 +381,11 @@ export default (async ({ worktree }: { worktree: string }) => {
   const chat_room_create = tool({
     description:
       "Create a project chat room with a stated purpose (who it is for, what it is about). " +
-      "You automatically join it. Invite the agents you want with chat_invite. Fails if a room " +
-      "with the same name and purpose already exists.",
+      "You automatically join it. Invite the agents you want with chat_invite. The room id is the " +
+      "lowercased name slug; creation fails if that id already exists.",
     args: {
       name: z.string().describe('Short room name, e.g. "auth-refactor"'),
-      purpose: z.string().describe("What this room is for, e.g. \"coordinate the JWT -> session-cookie migration\""),
+      purpose: z.string().describe('What this room is for, e.g. "coordinate the JWT -> session-cookie migration"'),
     },
     execute: async (args, ctx) => {
       const rec = ensureAgent(ctx)
@@ -293,7 +395,7 @@ export default (async ({ worktree }: { worktree: string }) => {
         if (existing.purpose === args.purpose.trim()) {
           return `Room "${existing.name}" already exists with that purpose. Join it: chat_room_join(room="${existing.id}")`
         }
-        return `Room name "${args.name}" is taken (id: ${existing.id}, purpose: ${existing.purpose}). Choose another name or join it.`
+        return `Room id "${id}" is taken (name: ${existing.name}, purpose: ${existing.purpose}). Choose another name or join it.`
       }
       const room: Room = {
         id,
@@ -301,18 +403,13 @@ export default (async ({ worktree }: { worktree: string }) => {
         purpose: args.purpose.trim(),
         createdBy: rec.name,
         createdAt: Date.now(),
+        first: 0,
         members: [rec.name],
         invites: [],
-        messages: [
-          {
-            i: 0,
-            ts: Date.now(),
-            from: rec.name,
-            text: `created room — purpose: ${args.purpose.trim()}`,
-          },
-        ],
+        messages: [],
       }
-      saveRoom(room)
+      pushMessage(room, rec.name, `created room — purpose: ${args.purpose.trim()}`)
+      writeJSON(roomFile(id), room)
       return `Created room "${room.name}" (id: ${room.id}) and joined you. Invite agents with chat_invite(room="${room.id}", agents=[...]); they will see the invite in chat_room_list.`
     },
   })
@@ -329,7 +426,7 @@ export default (async ({ worktree }: { worktree: string }) => {
       if (!rooms.length) return "No rooms exist yet. Create one with chat_room_create(name, purpose)."
       const lines = rooms.map((r) => {
         const mine = r.members.includes(rec.name)
-        const unread = mine ? unreadFor(rec, r) : 0
+        const unread = mine ? unreadCount(rec, r) : 0
         const last = r.messages[r.messages.length - 1]
         const flags = [
           mine ? "member" : invited.includes(r) ? "INVITED" : "",
@@ -351,32 +448,34 @@ export default (async ({ worktree }: { worktree: string }) => {
   const chat_room_join = tool({
     description:
       "Join a chat room (by id or name). Accepts any pending invitation for you. " +
-      "Returns any unread messages you missed in the room.",
+      "Returns any messages you have not read.",
     args: {
       room: z.string().describe("Room id or name (see chat_room_list)"),
     },
     execute: async (args, ctx) => {
       const rec = ensureAgent(ctx)
-      const room = resolveRoom(args.room)
-      if (!room) return roomListError(args.room)
+      const resolved = resolveRoom(args.room)
+      if (!resolved) return roomListError(args.room)
+      const wasMember = resolved.members.includes(rec.name)
       let acceptedInvite = false
-      if (!room.members.includes(rec.name)) {
-        room.members.push(rec.name)
-        if (room.invites.includes(rec.name)) {
-          room.invites = room.invites.filter((n) => n !== rec.name)
-          acceptedInvite = true
-        }
-        saveRoom(room)
+      if (!wasMember) {
+        mutateRoom(resolved.id, (r) => {
+          if (!r.members.includes(rec.name)) r.members.push(rec.name)
+          if (r.invites.includes(rec.name)) {
+            r.invites = r.invites.filter((n) => n !== rec.name)
+            acceptedInvite = true
+          }
+        })
       }
-      const agents = loadAgents()
-      const unseen = room.messages.slice(rec.reads[room.id] ?? 0)
-      rec.reads[room.id] = room.messages.length
-      agents[ctx.sessionID] = rec
-      saveAgents(agents)
+      const room = loadRoom(resolved.id) ?? resolved
+      const unseen = unseenFor(rec, room)
+      markRead(rec, room)
       const header = acceptedInvite
         ? `Accepted invitation and joined "${room.name}" (id: ${room.id}). Purpose: ${room.purpose}`
-        : `Joined "${room.name}" (id: ${room.id}). Purpose: ${room.purpose}`
-      if (!unseen.length) return `${header}\nNo messages yet.`
+        : wasMember
+          ? `Already a member of "${room.name}" (id: ${room.id}).`
+          : `Joined "${room.name}" (id: ${room.id}). Purpose: ${room.purpose}`
+      if (!unseen.length) return `${header}\nNo new messages.`
       return `${header}\n${unseen.length} message(s):\n${unseen.map((m) => msgLine(room, m)).join("\n")}`
     },
   })
@@ -391,38 +490,40 @@ export default (async ({ worktree }: { worktree: string }) => {
     },
     execute: async (args, ctx) => {
       const rec = ensureAgent(ctx)
-      const room = resolveRoom(args.room)
-      if (!room) return roomListError(args.room)
-      if (!room.members.includes(rec.name)) {
-        return `You must be a member of "${room.id}" to invite others. Join it first: chat_room_join(room="${room.id}")`
+      const resolved = resolveRoom(args.room)
+      if (!resolved) return roomListError(args.room)
+      if (!resolved.members.includes(rec.name)) {
+        return `You must be a member of "${resolved.id}" to invite others. Join it first: chat_room_join(room="${resolved.id}")`
       }
-      const known = takenNames(loadAgents())
+      const agents = loadAgents()
+      const byName = new Map(Object.values(agents).map((a) => [a.name, a]))
       const done: string[] = []
       const failed: string[] = []
       for (const target of args.agents) {
         const t = target.trim()
-        if (room.members.includes(t)) {
+        if (resolved.members.includes(t)) {
           failed.push(`${t}: already a member`)
           continue
         }
-        if (!known.has(t)) {
+        const holder = byName.get(t)
+        if (!holder) {
           failed.push(`${t}: not a registered agent (check chat_agents)`)
           continue
         }
-        if (!room.invites.includes(t)) room.invites.push(t)
+        if (!(await sessionAlive(holder.sessionID))) {
+          failed.push(`${t}: session has exited`)
+          continue
+        }
+        mutateRoom(resolved.id, (r) => {
+          if (!r.invites.includes(t) && !r.members.includes(t)) r.invites.push(t)
+        })
         done.push(t)
       }
       if (done.length) {
-        room.messages.push({
-          i: room.messages.length,
-          ts: Date.now(),
-          from: rec.name,
-          text: `invited ${done.join(", ")} to this room`,
-        })
-        saveRoom(room)
+        mutateRoom(resolved.id, (r) => pushMessage(r, rec.name, `invited ${done.join(", ")} to this room`))
       }
-      const parts = []
-      if (done.length) parts.push(`Invited: ${done.join(", ")}. They accept by calling chat_room_join(room="${room.id}").`)
+      const parts: string[] = []
+      if (done.length) parts.push(`Invited: ${done.join(", ")}. They accept by calling chat_room_join(room="${resolved.id}").`)
       if (failed.length) parts.push(`Not invited:\n${failed.map((f) => `  - ${f}`).join("\n")}`)
       return parts.join("\n")
     },
@@ -438,41 +539,30 @@ export default (async ({ worktree }: { worktree: string }) => {
     },
     execute: async (args, ctx) => {
       const rec = ensureAgent(ctx)
-      const room = resolveRoom(args.room)
-      if (!room) return roomListError(args.room)
-      if (!room.members.includes(rec.name)) {
-        return `You are not a member of "${room.id}". Join first: chat_room_join(room="${room.id}")`
+      const resolved = resolveRoom(args.room)
+      if (!resolved) return roomListError(args.room)
+      if (!resolved.members.includes(rec.name)) {
+        return `You are not a member of "${resolved.id}". Join first: chat_room_join(room="${resolved.id}")`
       }
-      const m: Message = {
-        i: room.messages.length,
-        ts: Date.now(),
-        from: rec.name,
-        text: args.message.trim().slice(0, 4000),
-      }
-      room.messages.push(m)
-      if (room.messages.length > MAX_MESSAGES) {
-        const cut = room.messages.length - MAX_MESSAGES
-        room.messages = room.messages.slice(cut)
-        room.messages.forEach((x, idx) => (x.i = idx))
-      }
-      saveRoom(room)
-      const agents = loadAgents()
-      const r = agents[ctx.sessionID]
-      if (r) {
-        r.reads[room.id] = room.messages.length
-        saveAgents(agents)
-      }
-      return `Posted to #${room.id} as ${rec.name}: ${m.text}`
+      let posted: Message | undefined
+      const room =
+        mutateRoom(resolved.id, (r) => {
+          if (!r.members.includes(rec.name)) r.members.push(rec.name)
+          posted = pushMessage(r, rec.name, args.message)
+        }) ?? resolved
+      if (posted) markRead(rec, room)
+      return `Posted to #${room.id} as ${rec.name}: ${posted?.text ?? args.message}`
     },
   })
 
   const chat_read = tool({
     description:
       "Read a chat room's messages. By default returns only messages you have not read yet; " +
-      "pass include_read=true to reread the full history. Marks them read so the next call only shows new ones.",
+      "pass include_read=true to reread the full retained history. Marks them read so the next " +
+      "call only shows new ones.",
     args: {
       room: z.string().describe("Room id or name"),
-      include_read: z.boolean().optional().describe("Reread the entire history, not just unread messages"),
+      include_read: z.boolean().optional().describe("Reread the retained history, not just unread messages"),
     },
     execute: async (args, ctx) => {
       const rec = ensureAgent(ctx)
@@ -481,13 +571,10 @@ export default (async ({ worktree }: { worktree: string }) => {
       if (!room.members.includes(rec.name)) {
         return `You are not a member of "${room.id}". Join first: chat_room_join(room="${room.id}")`
       }
-      const agents = loadAgents()
-      const mine = agents[ctx.sessionID]
-      const unseen = room.messages.slice(mine.reads[room.id] ?? 0)
-      mine.reads[room.id] = room.messages.length
-      saveAgents(agents)
+      const unseen = unseenFor(rec, room)
+      markRead(rec, room)
       const shown = args.include_read ? room.messages : unseen
-      if (!shown.length) return `#${room.id}: no new messages. (${room.messages.length} total in history)`
+      if (!shown.length) return `#${room.id}: no new messages. (${roomTotal(room)} total, ${room.messages.length} retained)`
       const header = `#${room.id} — ${shown.length} message(s)` + (unseen.length && !args.include_read ? " (new)" : "")
       return `${header}\n${shown.map((m) => msgLine(room, m)).join("\n")}`
     },
@@ -506,32 +593,53 @@ export default (async ({ worktree }: { worktree: string }) => {
       chat_read,
     },
 
-    // Track what each registered session is doing, for chat_agents.
+    event: async ({ event }: { event: { type: string; properties?: any } }) => {
+      if (event.type === "session.deleted") {
+        const id: string | undefined = event.properties?.info?.id
+        if (!id) return
+        deadCache.add(id)
+        activity.delete(id)
+        const agents = loadAgents()
+        if (agents[id]) {
+          delete agents[id]
+          writeJSON(agentsFile(), agents)
+        }
+      }
+    },
+
+    // Track what each session is doing, for chat_agents. Fires for all
+    // registered tools including this plugin's own.
     "tool.execute.before": async (input: { tool: string; sessionID: string }) => {
       activity.set(input.sessionID, { tool: input.tool, ts: Date.now() })
+      if (activity.size > MAX_ACTIVITY) {
+        const oldest = activity.keys().next().value
+        if (oldest !== undefined && oldest !== input.sessionID) activity.delete(oldest)
+      }
+      deadCache.delete(input.sessionID)
     },
 
     // Advertise the coordination system (and the caller's identity) in the
     // system prompt so every agent knows the chat tools exist.
     "experimental.chat.system.transform": async (input: { sessionID?: string }, output: { system: string[] }) => {
+      const lines = [
+        "# Agent coordination (agentchat)",
+        "Chat tools are available so agents working on this project can coordinate instead of working blind:",
+        "- chat_agents: directory of every agent, its unique name, and what it is doing.",
+        "- chat_room_create(name, purpose) / chat_room_list / chat_room_join: project chat rooms by topic.",
+        "- chat_invite(room, agents): pull other agents into your room.",
+        "- chat_post / chat_read: exchange messages in rooms you are a member of.",
+        "- chat_status(status): publish what you are doing so others can see it.",
+        "- chat_register(name): claim or check your unique chat name.",
+      ]
       if (input.sessionID) {
         const rec = loadAgents()[input.sessionID]
-        if (rec) activity.set(rec.sessionID, { tool: "chat-system", ts: Date.now() })
+        if (rec) {
+          lines.push(`You are registered as "${rec.name}". Run chat_room_list to see rooms relevant to your task and join them.`)
+        } else {
+          lines.push("You are automatically registered under a unique name the first time you use any chat_* tool.")
+        }
       }
-      output.system.push(
-        [
-          "# Agent coordination (agentchat)",
-          "Multiple agents are working in this project. Coordinate instead of working blind:",
-          "- chat_agents: directory of every agent, its unique name, and what it is doing.",
-          "- chat_room_create(name, purpose) / chat_room_list / chat_room_join: project chat rooms by topic.",
-          "- chat_invite(room, agents): pull other agents into your room.",
-          "- chat_post / chat_read: exchange messages in rooms you are a member of.",
-          "- chat_status(status): publish what you are doing so others can see it.",
-          "- chat_register(name): claim a memorable unique name.",
-          "If your session has been registered, your chat name is stated above; run chat_register with no args to check. " +
-          "Check chat_room_list for rooms relevant to your task and join them; post status updates at milestones.",
-        ].join("\n"),
-      )
+      output.system.push(lines.join("\n"))
     },
   }
 }) satisfies Plugin

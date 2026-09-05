@@ -6,9 +6,18 @@ import AgentChat from "../index.ts"
 
 const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "agentchat-"))
 
+const alive = new Set(["ses_build_primary01", "ses_be_task_aaa1", "ses_fe_task_bbb2"])
+
 async function main() {
+  const fakeClient = {
+    session: {
+      get: async ({ path: { id } }: { path: { id: string } }) =>
+        alive.has(id) ? { data: { id }, error: undefined } : { data: undefined, error: { status: 404 } },
+    },
+  }
   const hooks = await AgentChat({
     worktree,
+    client: fakeClient,
   } as never)
 
   const t = hooks.tool as Record<string, { execute: (a: never, c: ToolContext) => Promise<string> }>
@@ -55,12 +64,39 @@ async function main() {
   await run("read fe (new only)", "chat_read", { room: "refactor" }, fe)
   await run("read fe (history)", "chat_read", { room: "refactor", include_read: true }, fe)
   await run("read by room name", "chat_read", { room: "Refactor" }, be)
-  await run("final directory", "chat_agents", {}, be)
 
   // rename carries membership over
   await run("rename fe", "chat_register", { name: "ui-dev" }, fe)
   const room = JSON.parse(fs.readFileSync(path.join(worktree, ".agentchat", "rooms", "refactor.json"), "utf8"))
   console.assert(room.members.includes("ui-dev"), "membership not carried over on rename")
+
+  // final directory (all three alive)
+  await run("final directory", "chat_agents", {}, be)
+
+  // dead-session handling: fe exits
+  alive.delete("ses_fe_task_bbb2")
+  await run("create room for dead tests", "chat_room_create", { name: "archive", purpose: "wrap-up notes" }, build)
+  await run("invite dead fails", "chat_invite", { room: "archive", agents: ["ui-dev"] }, build)
+  await run("dead agent listed as exited", "chat_agents", {}, build)
+  await run("reclaim dead name", "chat_register", { name: "ui-dev" }, be)
+  const afterReclaim = JSON.parse(fs.readFileSync(path.join(worktree, ".agentchat", "rooms", "refactor.json"), "utf8"))
+  console.assert(!afterReclaim.members.includes("ui-dev"), "dead name not purged from members on reclaim")
+  await run("rename be back", "chat_register", { name: "backend-dev" }, be)
+  const afterBack = JSON.parse(fs.readFileSync(path.join(worktree, ".agentchat", "rooms", "refactor.json"), "utf8"))
+  console.assert(afterBack.members.includes("backend-dev"), "membership should carry to backend-dev")
+
+  // trimming: exceed MAX_MESSAGES and confirm stale cursors still see new posts
+  await run("create trim room", "chat_room_create", { name: "trim", purpose: "test trimming" }, build)
+  for (let i = 1; i <= 1002; i++) await t["chat_post"].execute({ room: "trim", message: `m${i}` } as never, build)
+  const trimRoom = JSON.parse(fs.readFileSync(path.join(worktree, ".agentchat", "rooms", "trim.json"), "utf8"))
+  console.assert(trimRoom.messages.length === 1000, `expected 1000 retained, got ${trimRoom.messages.length}`)
+  console.assert(trimRoom.first === 3, `expected first=3, got ${trimRoom.first}`)
+  console.assert(trimRoom.messages[0].i === 3, `expected first msg i=3, got ${trimRoom.messages[0].i}`)
+  await run("be joins trim", "chat_room_join", { room: "trim" }, be)
+  await run("be posts after trim", "chat_post", { room: "trim", message: "post-trim-be" }, be)
+  await run("captain sees post-trim (cursor survived trim)", "chat_read", { room: "trim" }, build)
+  await run("captain unread count sane", "chat_room_list", {}, build)
+
   console.log("\nOK — state in", path.join(worktree, ".agentchat"))
 }
 

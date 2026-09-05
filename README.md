@@ -16,7 +16,7 @@ Every agent session (the main agent or any subagent) automatically gets a **uniq
 | `chat_room_join` | Join a room by id/name; accepts a pending invitation; shows what you missed |
 | `chat_invite` | Invite registered agents to a room you're a member of |
 | `chat_post` | Send a message to a room you're in |
-| `chat_read` | Read only the messages you haven't seen yet (or full history with `include_read`) |
+| `chat_read` | Read only the messages you haven't seen yet (or the retained history with `include_read`) |
 
 A short coordination blurb (including your chat name) is injected into every agent's system prompt, so subagents discover the tools without being told.
 
@@ -30,10 +30,11 @@ All state lives in the project under `.agentchat/`:
 └── rooms/<id>.json    # purpose, members, invites, message log per room
 ```
 
-- **Identity** — the first time a session touches any chat tool it is registered as `<agent-type>-<session-id suffix>` (e.g. `build-a1b2`); `chat_register` renames it.
-- **Activity** — the plugin watches `tool.execute.before`, so `chat_agents` shows each session's latest tool and when it was active, even without manual status updates.
+- **Identity** — the first time a session touches any chat tool it is registered as `<agent-type>-<session-id suffix>` (e.g. `build-a1b2`); `chat_register` renames it (memberships follow you). Names held by exited sessions can be reclaimed.
+- **Activity** — the plugin watches `tool.execute.before`, so `chat_agents` shows each session's latest tool and when it was active, even without manual status updates. Exited sessions are marked `[exited]`.
 - **Invites are pull-based** — an invited agent sees `INVITED` in `chat_room_list` and accepts by calling `chat_room_join`. There is no interruption of other sessions (opencode plugins can't inject into a running turn).
-- Writes are atomic (temp file + rename), and the state survives opencode restarts. Commit `.agentchat/` or gitignore it, as you prefer.
+- **Durability** — atomic writes (temp file + rename), corrupt-state quarantine, and merge-on-save so multiple opencode processes on one worktree don't clobber each other. Room history keeps the last 1000 messages; per-agent read positions survive trimming exactly.
+- Commit `.agentchat/` or gitignore it, as you prefer.
 
 ## Install
 
@@ -77,10 +78,14 @@ captain
   chat_agents                   # who is doing what, right now
 ```
 
-## Development
+## Development & maintenance
 
 ```bash
 npm install
-npx tsc --noEmit     # typecheck
+npx tsc --noEmit       # typecheck against the pinned plugin SDK
 npx tsx test/smoke.ts  # end-to-end tool simulation in a temp project
 ```
+
+`docs/MAINTENANCE.md` is the maintenance manual: state schema, invariants,
+tool contracts, and the exact opencode integration surface to re-verify on
+every opencode upgrade (AGENTS.md points agents at it automatically).
