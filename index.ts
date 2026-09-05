@@ -658,7 +658,14 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
           lines.push("You are automatically registered under a unique name the first time you use any chat_* tool.")
         }
       }
-      output.system.push(lines.join("\n"))
+      const block = lines.join("\n")
+      const parts = output.system.map((s) => s.trim()).filter((s) => s.length > 0)
+      // opencode maps every system entry to its own system-role message;
+      // SGLang/vLLM reject a system message that isn't the first one
+      // ("System message must be at the beginning."). Always collapse to a
+      // single system message.
+      if (parts.length === 0) output.system.push(block)
+      else output.system.splice(0, output.system.length, parts.concat(block).join("\n\n"))
     },
   }
 }) satisfies Plugin

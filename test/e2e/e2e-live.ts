@@ -73,6 +73,7 @@ for (const d of [CFG_DIR, XDG_DATA, XDG_STATE, XDG_CACHE, path.join(PROJ, ".open
   fs.mkdirSync(d, { recursive: true })
 const serveLogChunks: string[] = []
 const eventsLogChunks: string[] = []
+const systemIssues: string[] = []
 function appendFile(file: string, s: string) {
   try {
     fs.appendFileSync(file, s)
@@ -153,6 +154,13 @@ const mockServer = http.createServer((req, res) => {
       return
     }
     const decision = decide(body)
+    const sysMsgs: any[] = body.messages ?? []
+    let seenNonSystem = false
+    for (const mm of sysMsgs) {
+      if (mm?.role === "system") {
+        if (seenNonSystem) systemIssues.push(`req #${mockLog.length + 1}: system role seen after non-system (${sysMsgs.map((x: any) => x.role).join(",")})`)
+      } else seenNonSystem = true
+    }
     const entry = {
       n: mockLog.length + 1,
       stream: !!body.stream,
@@ -569,6 +577,7 @@ async function main() {
 
   // 10. assertions — clean text endings
   check(sessionErrors.length === 0, `no session.error / assistant errors`, sessionErrors)
+  check(systemIssues.length === 0, `every request keeps system messages at the start`, systemIssues)
   const aTexts = [...(textParts.get(A) ?? new Map()).values()].filter((t) => t.includes("E2E-DONE"))
   const bTexts = [...(textParts.get(B) ?? new Map()).values()].filter((t) => t.includes("E2E-DONE"))
   check(aTexts.length === 2, `A ended with text on both turns`, aTexts)
