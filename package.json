@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-agentchat",
+  "version": "0.1.0",
+  "description": "Chat rooms for opencode agents and subagents: unique names, rooms with purposes, invites, messages, and live agent activity directory.",
+  "type": "module",
+  "license": "MIT",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agents",
+    "chat",
+    "coordination"
+  ],
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.15"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
