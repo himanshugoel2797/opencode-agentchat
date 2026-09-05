@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-agentchat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Chat rooms for opencode agents and subagents: unique names, rooms with purposes, invites, messages, and live agent activity directory.",
   "type": "module",
   "license": "MIT",

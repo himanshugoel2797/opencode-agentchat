@@ -140,10 +140,19 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     return true
   }
 
-  const roomFile = (id: string) => path.join(roomsDir, `${id}.json`)
+  // Room identity is the FILENAME; embedded ids in hand-edited files are
+  // never trusted (a crafted id like "../../x" must not reach roomFile()).
+  const ROOM_ID_RE = /^[a-z0-9-]+$/
 
-  const normalizeRoom = (r: Room | undefined): Room | undefined => {
-    if (!r || !r.id) return undefined
+  const roomFile = (id: string) => {
+    if (!ROOM_ID_RE.test(id)) throw new Error(`invalid room id: ${JSON.stringify(id)}`)
+    return path.join(roomsDir, `${id}.json`)
+  }
+
+  // expectedId = the filename this room was loaded from; a mismatch means the
+  // file was hand-edited and is skipped (never written back under its id).
+  const normalizeRoom = (r: Room | undefined, expectedId: string): Room | undefined => {
+    if (!r || !r.id || r.id !== expectedId || !ROOM_ID_RE.test(expectedId)) return undefined
     r.first = typeof r.first === "number" ? r.first : 0
     r.members ??= []
     r.invites ??= []
@@ -151,7 +160,7 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     return r
   }
 
-  const loadRoom = (id: string): Room | undefined => normalizeRoom(loadRoomRaw(id))
+  const loadRoom = (id: string): Room | undefined => normalizeRoom(loadRoomRaw(id), id)
   function loadRoomRaw(id: string): Room | undefined {
     try {
       return readJSON<Room>(roomFile(id), undefined as unknown as Room)
@@ -196,7 +205,7 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
       return fs
         .readdirSync(roomsDir)
         .filter((f) => f.endsWith(".json"))
-        .map((f) => normalizeRoom(readJSON<Room>(path.join(roomsDir, f), undefined as unknown as Room)))
+        .map((f) => normalizeRoom(readJSON<Room>(path.join(roomsDir, f), undefined as unknown as Room), f.slice(0, -".json".length)))
         .filter((r): r is Room => !!r)
     } catch {
       return []
@@ -290,7 +299,17 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
         if (await sessionAlive(holder.sessionID)) {
           return `Name "${name}" is already taken by another active agent. Pick another (see chat_agents).`
         }
+        // The liveness check above is an await point: another process may
+        // have reclaimed the name in the meantime. Re-check against fresh
+        // state before touching anything.
         const fresh = loadAgents()
+        if (
+          Object.values(fresh).some(
+            (a) => a.name === name && a.sessionID !== ctx.sessionID && a.sessionID !== holder.sessionID,
+          )
+        ) {
+          return `Name "${name}" was claimed by another agent while you were checking. Pick another.`
+        }
         if (fresh[holder.sessionID]) {
           delete fresh[holder.sessionID]
           writeJSON(agentsFile(), fresh)

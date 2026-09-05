@@ -6,6 +6,15 @@ import AgentChat from "../index.ts"
 
 const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "agentchat-"))
 
+let assertFailures = 0
+const origAssert = console.assert.bind(console)
+console.assert = ((cond?: unknown, ...args: unknown[]) => {
+  if (!cond) {
+    assertFailures++
+    origAssert(false, args.map(String).join(" "))
+  }
+}) as typeof console.assert
+
 const alive = new Set(["ses_build_primary01", "ses_be_task_aaa1", "ses_fe_task_bbb2"])
 
 async function main() {
@@ -83,7 +92,12 @@ async function main() {
   console.assert(!afterReclaim.members.includes("ui-dev"), "dead name not purged from members on reclaim")
   await run("rename be back", "chat_register", { name: "backend-dev" }, be)
   const afterBack = JSON.parse(fs.readFileSync(path.join(worktree, ".agentchat", "rooms", "refactor.json"), "utf8"))
-  console.assert(afterBack.members.includes("backend-dev"), "membership should carry to backend-dev")
+  // be reclaimed a purged name, so it holds NO inherited membership from the
+  // dead agent; the later rename must not resurrect one either.
+  console.assert(
+    !afterBack.members.includes("backend-dev") && !afterBack.members.includes("ui-dev"),
+    "purged dead membership should not reappear on rename",
+  )
 
   // trimming: exceed MAX_MESSAGES and confirm stale cursors still see new posts
   await run("create trim room", "chat_room_create", { name: "trim", purpose: "test trimming" }, build)
@@ -97,6 +111,10 @@ async function main() {
   await run("captain sees post-trim (cursor survived trim)", "chat_read", { room: "trim" }, build)
   await run("captain unread count sane", "chat_room_list", {}, build)
 
+  if (assertFailures) {
+    console.error(`\nSMOKE FAILED: ${assertFailures} assertion failure(s)`)
+    process.exit(1)
+  }
   console.log("\nOK — state in", path.join(worktree, ".agentchat"))
 }
 

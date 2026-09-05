@@ -27,11 +27,16 @@ upgrade (§6).
 ```bash
 npx tsc --noEmit
 npx tsx test/smoke.ts
+npx tsx test/stress.ts        # adversarial suite; must be 0 FAIL, 0 XFAIL
+npx tsx test/e2e/e2e-live.ts  # real opencode serve + mock LLM; run before pushing
 ```
 
-Both must pass; new bug fixes need a new smoke step first. After an opencode
-version bump: bump `@opencode-ai/plugin` in `package.json`, typecheck, run the
-live checklist in `docs/MAINTENANCE.md` §7, update the §6 verification table.
+All must pass (e2e-live only when an `opencode` binary is available; ~60s on
+a cold plugin cache — keep the shared /tmp cache). New bug fixes need a
+failing smoke/stress step first. Never mark a stress check XFAIL without
+writing the analysis to `test/FINDINGS-STRESS.md`. After an opencode version
+bump: bump `@opencode-ai/plugin` in `package.json`, typecheck, run e2e-live
+(proves the §6 live surfaces), update the §6 verification table.
 
 Commit directly to `main` and `git push`; tag releases with `gh release
 create` (see §9). Update README.md user-facing behavior in the same commit.

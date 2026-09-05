@@ -18,7 +18,10 @@ database, no dependencies beyond `@opencode-ai/plugin`.
 | Path | Role |
 | --- | --- |
 | `index.ts` | Entire plugin: types, state helpers, 9 tools, 3 hooks. Single file by design. |
-| `test/smoke.ts` | End-to-end simulation: 3 fake agent sessions + fake `client` drive the real tool `execute` functions against a temp worktree. The primary regression harness. |
+| `test/smoke.ts` | Tool-layer simulation: 3 fake agent sessions + fake `client` drive the real tool `execute` functions against a temp worktree. Fast (~1s). |
+| `test/stress.ts` | Adversarial stress/edge suite (52 checks): multi-instance races on one worktree, liveness/death lifecycle, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~10s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). |
+| `test/e2e/e2e-live.ts` | TRUE end-to-end: boots a mock OpenAI-compatible LLM + real `opencode serve` in a fully isolated env (`XDG_CONFIG_HOME` **and `HOME`** overridden — opencode loads legacy `~/.opencode` regardless of XDG; keep HOME fake), then drives two real sessions through scripted `tool_calls` and asserts on-disk state + tool outputs captured from SSE. ~11s warm / ~60s cold. See `test/e2e/FINDINGS.md`. |
+| `test/FINDINGS-STRESS.md`, `test/e2e/FINDINGS.md` | Bug reports from adversarial passes; keep as history + severity rationale. Both reported bugs are fixed (their checks are now hard assertions). |
 | `docs/MAINTENANCE.md` | This file. |
 | `package.json` | Pins `@opencode-ai/plugin` (currently `1.18.15`). `main: index.ts` (opencode loads TS via bun). |
 | `tsconfig.json` | `strict`, `noEmit`, `allowImportingTsExtensions` (smoke test imports `../index.ts`). |
@@ -86,7 +89,11 @@ a bug found in adversarial review of v0.1.0)
   `deadCache` forever — opencode session ids never revive; queries fail
   **open** when the client errors). On reclaiming a dead name, the holder's
   record is deleted **and the dead name is purged from every room's
-  members/invites** before the rename.
+  members/invites** before the rename. **After the liveness `await`,
+  `chat_register` MUST re-read `agents.json` and re-check the claim**
+  (excluding self and the dead holder) before writing — everything after
+  that point is synchronous. Omitting the recheck reintroduced a
+  double-claim race (FINDINGS-STRESS Bug 1, regression check `03`).
 - **I6 — renames** (`chat_register name=`) sweep `members`/`invites` in all
   rooms. Message history and read cursors intentionally keep working:
   history stores the old name as a label; cursors are keyed by room id.
@@ -99,6 +106,12 @@ a bug found in adversarial review of v0.1.0)
 - **I8 — activity map is bounded** (`MAX_ACTIVITY = 200`, evict-oldest) and
   is only fed by `tool.execute.before`. Never add synthetic activity entries
   (v0.1.0's system-transform "chat-system" write lied in `chat_agents`).
+- **I9 — room identity is the FILENAME.** `normalizeRoom` skips any room file
+  whose embedded `id` mismatches its filename or fails `^[a-z0-9-]+$`, and
+  `roomFile()` throws on ids that fail the same regex — hand-edited files can
+  never be written back outside `rooms/` (FINDINGS-STRESS Bug 2, regression
+  check `09e`). Keep both guards; they are defense-in-depth against an
+  attacker who can already write `.agentchat/`.
 
 ## 5. Tool contracts
 
@@ -136,12 +149,14 @@ and this table, re-run §7, and note the change in git history.
 | I | Tool result | Returning a plain string is a valid `ToolResult`. | Smoke test. |
 | J | State dir writable | `.agentchat/` is created lazily under `worktree`. Unwritable fs surfaces as a tool error — acceptable, don't add silent fallbacks. | Manual. |
 
-## 7. Regression harness (always run both before pushing)
+## 7. Regression harness (always run all three before pushing)
 
 ```bash
 npm install
-npx tsc --noEmit        # types vs the pinned SDK
-npx tsx test/smoke.ts   # 25+ step E2E incl. trim/cursor, dead-name reclaim, invite flows
+npx tsc --noEmit          # types vs the pinned SDK
+npx tsx test/smoke.ts     # ~1s   tool-layer happy-path + trim/cursor basics
+npx tsx test/stress.ts    # ~10s  52 adversarial checks (races, liveness, corrupt, legacy, boundaries, refs)
+npx tsx test/e2e/e2e-live.ts   # ~11s warm / ~60s cold — REAL opencode serve + scripted mock LLM
 ```
 
 `test/smoke.ts` fakes only the opencode surface (`ToolContext` +
@@ -149,14 +164,29 @@ npx tsx test/smoke.ts   # 25+ step E2E incl. trim/cursor, dead-name reclaim, inv
 INVITED lifecycle, unread-cursor semantics, rename membership carry-over,
 dead-name purge, trim behavior at `MAX_MESSAGES` (posts 1002 messages — keep
 this even though slow; it is the regression test for the worst historical
-bug). When you fix any new bug, add a step here first.
+bug). When you fix any new bug, add a step to smoke or stress first.
 
-Live check after any opencode upgrade (in a real session with a subagent):
+`test/e2e/e2e-live.ts` is the authoritative check for the §6 live surfaces —
+it proves B (raw tool ids reach the model), D (`tool.execute.before` fires
+for plugin tools), E (system prompt block reaches sessions), G
+(`session.idle`/liveness) without a real LLM. Notes for keeping it green:
 
-1. Both agents see `chat_*` tools and the coordination prompt block.
-2. `chat_agents` shows both, with correct `(you)` marking and activity.
-3. create → invite → join → post → read round-trips; unread counts move.
-4. `.agentchat/` files match §3 schema.
+- Isolation needs BOTH `XDG_CONFIG_HOME` and `HOME` overridden (opencode
+  still loads legacy `~/.opencode` otherwise).
+- The plugin cache (`XDG_CACHE`, `/tmp/opencode-agentchat-e2e-cache`) is
+  deliberately SHARED across runs: opencode installs the plugin's npm deps
+  on first load and cold-cache registry fetches caused 10–160s startup
+  flakiness. Delete it to test cold-start behavior.
+- The mock drives turns by counting `role:"tool"` messages after the last
+  user message; `stream:true` single-chunk `tool_call` deltas work with
+  `@ai-sdk/openai-compatible` (v1.18.29). If a future opencode changes the
+  provider wire format, this harness fails FIRST — that is by design.
+- If plugin discovery regresses upstream, note: dir-symlinks under
+  `.opencode/plugins/` are NOT discovered (only direct file symlinks were);
+  the project must be `git init`ed or `worktree` resolves to `/`.
+
+Manual live check if e2e-live can't run (no `opencode` binary available):
+see git history of this section (pre-0.2 checklist).
 
 ## 8. Design decisions (don't casually reverse these)
 

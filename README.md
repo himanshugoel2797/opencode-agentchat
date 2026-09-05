@@ -82,8 +82,10 @@ captain
 
 ```bash
 npm install
-npx tsc --noEmit       # typecheck against the pinned plugin SDK
-npx tsx test/smoke.ts  # end-to-end tool simulation in a temp project
+npx tsc --noEmit             # typecheck against the pinned plugin SDK
+npx tsx test/smoke.ts        # tool-layer simulation (~1s)
+npx tsx test/stress.ts       # 52 adversarial checks: races, liveness, corruption (~10s)
+npx tsx test/e2e/e2e-live.ts # real `opencode serve` + mock LLM, two live sessions (~15s)
 ```
 
 `docs/MAINTENANCE.md` is the maintenance manual: state schema, invariants,
