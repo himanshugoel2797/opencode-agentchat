@@ -22,7 +22,10 @@ upgrade (§6).
   nested `.z`). No build step: ship `index.ts` as-is.
 - The plugin must never prompt or inject into other sessions (pull-based
   invites only). `chat_spawn` starts sessions the *user* sees, via zellij
-  tabs — never a headless hidden process.
+  tabs — never a headless hidden process. The one sanctioned exception is the
+  I11 wake: an `@name` `chat_post` ping typed into the recorded pane of an
+  idle, alive, spawned worker — never into user sessions or transient
+  subagents, and never while busy or cooldown-gated.
 - Liveness is the I5 **lease** (stamp via `markSeen` on every observed event,
   tool call, and chat request; 30s self-heartbeat). Never regress to treating
   the server's session list as liveness — finished subagents persist there
@@ -52,7 +55,10 @@ opencode-argv handling, or `PluginInput` root resolution must additionally be
 verified LIVE per MAINTENANCE §7a: drive `opencode run` to call `chat_spawn`,
 confirm a tab opens, the worker registers under `AGENTCHAT_NAME`, posts to the
 room, and `chat_agents` shows it alive; and run opencode in a non-git dir to
-confirm state lands in that directory, never `/`.
+confirm state lands in that directory, never `/`. Changes to the I11 wake
+(path `docs/MAINTENANCE.md` §7a step 4) must likewise be verified LIVE: an
+`@name` ping must appear typed in the worker's own tab, the worker must reply
+via its own tools, and it must return to idle for the next ping.
 
 Commit directly to `main` and `git push`; tag releases with `gh release
 create` (see §9). Update README.md user-facing behavior in the same commit.

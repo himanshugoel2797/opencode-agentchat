@@ -33,6 +33,16 @@ type AgentRecord = {
   registeredAt: number
   /** last confirmed activity/heartbeat; feeds the liveness lease (see I5) */
   lastSeen?: number
+  /** spawned persistent worker (claimed AGENTCHAT_NAME): wake-eligible (I11) */
+  persistent?: boolean
+  /** zellij pane id recorded by a spawned worker; wake types into it (I11) */
+  pane?: string
+  /** true while a turn is running (system.transform + session.status) */
+  busy?: boolean
+  /** last busy-stamp; bounds staleness if events never arrive */
+  busyAt?: number
+  /** last wake ping (rate limit, see I11) */
+  lastWokeAt?: number
   /** roomId -> absolute message count already seen (see docs/MAINTENANCE.md) */
   reads: Record<string, number>
 }
@@ -64,8 +74,23 @@ const MAX_ACTIVITY = 200
 const STALE_MS = 120_000 // quiet this long -> lease expires, listed as exited
 const HEARTBEAT_MS = 30_000 // persistent sessions re-stamp themselves
 const SEEN_MAX = 400
+const BUSY_STALE_MS = 300_000 // busy-stamps older than this don't block wakes
+const WAKE_COOLDOWN_MS = 60_000 // min gap between wake pings to one worker
 
-export default (async ({ client, worktree, directory, $ }: { client: any; worktree: string; directory?: string; $?: any }) => {
+export default (async ({
+  client,
+  worktree,
+  directory,
+  $,
+  wake: injectedWake,
+}: {
+  client: any
+  worktree: string
+  directory?: string
+  $?: any
+  /** test seam: replaces the real `zellij action write` delivery */
+  wake?: (pane: string, text: string) => Promise<void>
+}) => {
   // opencode resolves worktree to "/" for non-git projects. Fall back to the
   // session's directory so each project keeps its own .agentchat (instead of
   // sharing/failing on a root-level one), and chat_spawn cds somewhere sane.
@@ -88,6 +113,8 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
   const parentKind = new Map<string, "primary" | "sub" | "unknown">()
   let self: string | undefined
   const staleMs = Number.parseInt(process.env.AGENTCHAT_STALE_MS || "", 10) || STALE_MS
+  const wakeEnabled = process.env.AGENTCHAT_WAKE !== "0"
+  const wakeCooldownMs = Number.parseInt(process.env.AGENTCHAT_WAKE_COOLDOWN_MS || "", 10) || WAKE_COOLDOWN_MS
 
   // Bushook events carry the session id in different places depending on type
   // (session.* -> properties.info.id; message.* / part.* -> info/part.sessionID).
@@ -175,10 +202,35 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
     }
   }
 
+  // Busy tracking (I11 wakes skip busy workers). A chat request from a
+  // session means a turn is running; session.status/session.idle events
+  // confirm transitions. Only persist on CHANGE (this process caches the
+  // last value) so per-request stamps don't hammer the disk.
+  const busyCache = new Map<string, boolean>()
+
+  const stampBusy = (sessionID: string, busy: boolean) => {
+    if (busyCache.get(sessionID) === busy) return
+    busyCache.set(sessionID, busy)
+    const rec = loadAgents()[sessionID]
+    if (!rec) return
+    saveRecord({ ...rec, busy, busyAt: busy ? Date.now() : rec.busyAt ?? 0 })
+  }
+
+  const isBusy = (rec: AgentRecord) =>
+    rec.busy === true && Date.now() - (rec.busyAt ?? 0) < BUSY_STALE_MS
+
   const takenNames = (agents: Record<string, AgentRecord>): Set<string> =>
     new Set(Object.values(agents).map((a) => a.name))
 
   const sanitize = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 24) || "agent"
+
+  // ZELLIJ_PANE_ID arrives bare ("7") or named ("terminal_7"); write-chars -p
+  // accepts both but we store the canonical terminal_N form.
+  const currentPane = (): string | undefined => {
+    const p = (process.env.ZELLIJ_PANE_ID || "").trim()
+    if (!p) return undefined
+    return /^\d+$/.test(p) ? `terminal_${p}` : p
+  }
 
   // Lazily register the calling session under a unique default name. A
   // session spawned via chat_spawn claims AGENTCHAT_NAME (deterministic) and
@@ -192,6 +244,14 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
       if (!existing.lastSeen) {
         existing.lastSeen = Date.now()
         writeJSON(agentsFile(), agents)
+      }
+      const envName0 = (process.env.AGENTCHAT_NAME || "").trim()
+      if (!existing.persistent && envName0 && envName0 === existing.name) {
+        // this process is the deterministic spawn target under its own name:
+        // adopt the persistent-worker flag (wake-eligible, I11)
+        saveRecord({ ...existing, persistent: true, pane: currentPane() ?? existing.pane })
+        maybeAutoJoin(existing)
+        return existing
       }
       maybeAutoJoin(existing)
       return existing
@@ -216,6 +276,8 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
       statusAt: 0,
       registeredAt: Date.now(),
       lastSeen: Date.now(),
+      persistent: wanted !== undefined,
+      pane: wanted !== undefined ? currentPane() : undefined,
       reads: {},
     })
     maybeAutoJoin(rec)
@@ -237,6 +299,65 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
       // server unreachable — fail open
     }
     return true
+  }
+
+  // I11 — guarded wake-on-ping. An @mention in a posted message wakes an
+  // IDLE, ALIVE, PERSISTENT (chat_spawned) member by TYPING the envelope
+  // into the worker's own zellij pane (`zellij action write-chars -p <pane>`
+  // + Enter) — the woken turn therefore runs in the worker's OWN process and
+  // is visible live in its tab; the poster's lifetime is irrelevant.
+  // Everything else stays strictly pull-based: user sessions and transient
+  // subagents have no recorded pane and are NEVER typed into. Returns lines
+  // describing wakes/failures (empty when nothing qualified).
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const mentionsName = (text: string, name: string) =>
+    new RegExp(`@${escapeRe(name)}(?![A-Za-z0-9_-])`).test(text)
+
+  const defaultWake = (pane: string, text: string) =>
+    new Promise<void>((resolve, reject) => {
+      execFile("zellij", ["action", "write-chars", "-p", pane, text], { cwd: base }, (e1) => {
+        if (e1) return reject(e1)
+        execFile("zellij", ["action", "write", "-p", pane, "13"], { cwd: base }, (e2) =>
+          e2 ? reject(e2) : resolve(),
+        )
+      })
+    })
+
+  const wakeSend: ((pane: string, text: string) => Promise<void>) | undefined =
+    typeof injectedWake === "function" ? injectedWake : shellHandle ? defaultWake : undefined
+
+  const wakeWorkers = async (room: Room, poster: AgentRecord, text: string): Promise<string[]> => {
+    if (!wakeEnabled || !wakeSend) return []
+    const lines: string[] = []
+    for (const name of room.members) {
+      if (name === poster.name || !mentionsName(text, name)) continue
+      const rec = Object.values(loadAgents()).find((a) => a.name === name)
+      if (!rec?.persistent) continue // never wake user sessions or transient subagents
+      if (isBusy(rec)) continue
+      if (Date.now() - (rec.lastWokeAt ?? 0) < wakeCooldownMs) continue
+      if (!(await sessionAlive(rec.sessionID))) continue
+      const fresh = loadAgents()[rec.sessionID]
+      if (!fresh || isBusy(fresh) || Date.now() - (fresh.lastWokeAt ?? 0) < wakeCooldownMs) continue
+      if (!fresh.pane) {
+        lines.push(`wake ${name}: skipped (no terminal pane recorded)`)
+        continue
+      }
+      const now = Date.now()
+      saveRecord({ ...fresh, lastWokeAt: now })
+      const oneLine = (s: string) => s.replace(/[\r\n]+/g, " ")
+      const excerpt = oneLine(text).length > 300 ? `${oneLine(text).slice(0, 300)}…` : oneLine(text)
+      const envelope =
+        `[agentchat] ${poster.name} pinged you in room "${room.id}": "${excerpt}". ` +
+        `Call chat_read(room="${room.id}") and reply with chat_post; other messages may be waiting. ` +
+        `Do not wake other agents unless asked.`
+      try {
+        await wakeSend(fresh.pane, envelope)
+        lines.push(`woke ${name} (typed into pane ${fresh.pane})`)
+      } catch (e: any) {
+        lines.push(`wake ${name}: failed (${String(e?.message ?? e).slice(0, 120)})`)
+      }
+    }
+    return lines
   }
 
   // The session of THIS opencode process (a primary, non-subagent session)
@@ -514,6 +635,7 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
       "agent type, what it is doing (its status summary), its most recent activity, and which rooms it is in. " +
       "Liveness is lease-based: sessions that have gone quiet for ~2 minutes are shown as exited, so finished " +
       "subagents disappear from the directory automatically while idle-but-open persistent sessions stay alive. " +
+      "Persistent workers shown as alive (idle) can be woken with an @name mention in chat_post. " +
       "Use this to find who to invite to a room or who to ask for help.",
     args: {},
     execute: async (_args, ctx) => {
@@ -532,11 +654,18 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
         const doing =
           a.status || (act ? `active (last tool: ${act.tool}, ${ago(act.ts)})` : alive ? "idle" : "-")
         const rooms = roomsFor(a.name).map((r) => r.id)
-        const status = a.sessionID === me.sessionID ? "alive (you)" : alive ? "alive" : "exited"
+        const status =
+          a.sessionID === me.sessionID
+            ? "alive (you)"
+            : alive
+              ? isBusy(a)
+                ? "alive (busy)"
+                : "alive (idle)"
+              : "exited"
         const seenAt = Math.max(a.lastSeen ?? 0, act?.ts ?? 0, a.statusAt ?? 0)
         lines.push(
           [
-            `- ${a.name} [type: ${a.agent}]`,
+            `- ${a.name} [type: ${a.agent}${a.persistent ? ", persistent worker" : ""}]`,
             `  liveness: ${status}`,
             `  doing: ${doing}`,
             `  last seen: ${seenAt ? ago(seenAt) : "never"}`,
@@ -722,6 +851,8 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
     description:
       "Post a message to a chat room you are a member of. All members (agents and subagents) see it when " +
       "they chat_read the room. " +
+      "Mentioning an idle persistent worker with @<name> wakes it so it reads and can reply; mentions of " +
+      "other members are inert (pull-based). " +
       "Use for coordination: progress notes, requests, findings, handoffs.",
     args: {
       room: z.string().describe("Room id or name"),
@@ -741,7 +872,9 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
           posted = pushMessage(r, rec.name, args.message)
         }) ?? resolved
       if (posted) markRead(rec, room)
-      return `Posted to #${room.id} as ${rec.name}: ${posted?.text ?? args.message}`
+      const wakeLines = await wakeWorkers(room, rec, args.message)
+      const head = `Posted to #${room.id} as ${rec.name}: ${posted?.text ?? args.message}`
+      return wakeLines.length ? `${head}\n${wakeLines.join("\n")}` : head
     },
   })
 
@@ -776,6 +909,7 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
       "Spawn a NEW persistent opencode session in a new zellij tab (your terminal must be running inside zellij). " +
       "The new session joins the project's agentchat directory under the given name (deterministic) and stays " +
       "reachable in chat rooms even while idle, outliving your current agent/subagent. " +
+      "While idle you can wake it by @mentioning its name in a chat_post. " +
       "Talk to it with chat_post / chat_read and see it in chat_agents.",
     args: {
       name: z.string().describe("Unique chat name for the spawned worker (letters, digits, dash, underscore, max 32)"),
@@ -847,7 +981,7 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
         const errText = String(e?.stderr ?? e?.message ?? "").slice(0, 500).trim()
         return `zellij failed (exit ${code}): ${errText}`
       }
-      const head = `Spawned persistent worker "${name}" in a new zellij tab. It registers under AGENTCHAT_NAME on its first chat tool use.${room ? ` Auto-joined room "${room.id}".` : ""}`
+      const head = `Spawned persistent worker "${name}" in a new zellij tab. It records its pane and registers under AGENTCHAT_NAME on its first chat tool use; @${name} in a chat_post wakes it.${room ? ` Auto-joined room "${room.id}".` : ""}`
       return `${head}\nTalk to it with chat_post / chat_read; watch it in chat_agents.`
     },
   })
@@ -869,6 +1003,10 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
     event: async ({ event }: { event: { type: string; properties?: any } }) => {
       const live = eventSessionID(event)
       if (live) markSeen(live)
+      if (event.type === "session.status" || event.type === "session.idle") {
+        const id: string | undefined = event.properties?.sessionID
+        if (id) stampBusy(id, event.type === "session.status" ? event.properties?.status?.type !== "idle" : false)
+      }
       if (event.type === "session.deleted") {
         const id: string | undefined = event.properties?.info?.id ?? event.properties?.sessionID
         if (!id) return
@@ -893,6 +1031,7 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
       }
       deadCache.delete(input.sessionID)
       markSeen(input.sessionID)
+      if (input.tool.startsWith("chat_")) stampBusy(input.sessionID, true)
       void classifySelf(input.sessionID)
     },
 
@@ -901,6 +1040,7 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
     "experimental.chat.system.transform": async (input: { sessionID?: string }, output: { system: string[] }) => {
       if (input.sessionID) {
         markSeen(input.sessionID)
+        stampBusy(input.sessionID, true)
         void classifySelf(input.sessionID)
       }
       const lines = [
@@ -909,7 +1049,7 @@ export default (async ({ client, worktree, directory, $ }: { client: any; worktr
         "- chat_agents: directory of every agent/subagent, its unique name, live/exited status, and what it is doing.",
         "- chat_room_create(name, purpose) / chat_room_list / chat_room_join: project chat rooms by topic.",
         "- chat_invite(room, agents): pull other agents/subagents into your room.",
-        "- chat_post / chat_read: exchange messages in rooms you are a member of.",
+        "- chat_post / chat_read: exchange messages in rooms you are a member of; @name in a post wakes an idle persistent worker.",
         "- chat_status(status): publish what you are doing so others can see it.",
         "- chat_register(name): claim or check your unique chat name.",
         "- chat_spawn(name, ...): start a persistent worker session in a new zellij tab.",

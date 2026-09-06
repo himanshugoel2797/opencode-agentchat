@@ -383,8 +383,8 @@ async function secLiveness() {
   const thrLiveness = (thrBlock.match(/liveness: ([^\n]+)/) || [])[1] || ""
   const thrDoing = (thrBlock.match(/doing: ([^\n]+)/) || [])[1] || ""
   const invThr = await I1.exec("chat_invite", { room: "dock", agents: ["thrower"] }, c("prim", "build"))
-  check("04d", "client that THROWS fails open: liveness alive, 'idle', invite succeeds",
-    !!thrEntry && thrLiveness === "alive" && thrDoing === "idle" && /Invited: thrower/.test(invThr),
+  check("04d", "client that THROWS fails open: liveness alive(idle), 'idle', invite succeeds",
+    !!thrEntry && /^alive( \(idle\))?$/.test(thrLiveness) && thrDoing === "idle" && /Invited: thrower/.test(invThr),
     `entry="${thrEntry}" liveness="${thrLiveness}" doing="${thrDoing}" invite=${invThr}`)
 
   // [05] session.deleted pruning, shared via disk between instances
@@ -445,8 +445,9 @@ async function secSpawn() {
     ctrl.alive.add(w)
     const out1 = await I1.exec("chat_status", { status: "on duty" }, ctx(w, "worker"))
     const rec = readAgents(wt)[w]
-    check("SP2a", "AGENTCHAT_NAME env gives the spawned worker a deterministic chat name",
-      /Status updated/.test(out1) && rec?.name === "worker1", `rec=${JSON.stringify(rec)} out=${out1}`)
+    check("SP2a", "AGENTCHAT_NAME env gives the spawned worker a deterministic chat name (and persistent flag)",
+      /Status updated/.test(out1) && rec?.name === "worker1" && rec?.persistent === true,
+      `rec=${JSON.stringify(rec)} out=${out1}`)
     const hq = readRoom(wt, "ops")
     check("SP2b", "AGENTCHAT_ROOM env auto-joins the spawned worker",
       hq.members.includes("worker1"), `members=${JSON.stringify(hq.members)}`)
@@ -520,6 +521,168 @@ async function secRootFallback() {
     else process.env.ZELLIJ = prevZ
   }
 }
+
+// ======================================================== section WAKE (I11):
+// @mention wake-on-ping guard matrix. Delivery is a typed key-injection into
+// the worker's zellij pane; the suite injects a `wake` seam (the PluginInput
+// `wake` override) so it never touches a real zellij.
+async function secWake() {
+  console.log("\n--- section WAKE ---")
+  const wt = mkwt("wake")
+  const ctrl = makeClient()
+  const wakeDeliveries: Array<{ pane: string; text: string }> = []
+  let wakeFails = false
+  const wake = async (pane: string, text: string) => {
+    if (wakeFails) throw new Error("synthetic wake delivery failure")
+    wakeDeliveries.push({ pane, text })
+  }
+  const I = await makeInst(wt, ctrl.client, { wake })
+  const ctx = makeCtx(wt)
+  const host = ctx("ses_wake_host___01", "build")
+  ctrl.alive.add("ses_wake_host___01")
+  await I.exec("chat_register", { name: "host" }, host)
+  await I.exec("chat_room_create", { name: "ops", purpose: "wake room" }, host)
+
+  const setWorkerEnv = (name: string, pane: string) => {
+    process.env.AGENTCHAT_NAME = name
+    process.env.AGENTCHAT_ROOM = "ops"
+    process.env.ZELLIJ_PANE_ID = pane
+  }
+  const prevEnv = {
+    NAME: process.env.AGENTCHAT_NAME,
+    ROOM: process.env.AGENTCHAT_ROOM,
+    PANE: process.env.ZELLIJ_PANE_ID,
+  }
+  try {
+    const w = "ses_wake_worker__02"
+    ctrl.alive.add(w)
+    setWorkerEnv("worker1", "terminal_9")
+    await I.exec("chat_status", { status: "on duty" }, ctx(w, "worker"))
+    const wrec = readAgents(wt)[w]
+    check("W0", "env-claimed worker is persistent + records its canonical zellij pane",
+      wrec?.persistent === true && wrec?.pane === "terminal_9", JSON.stringify({ p: wrec?.persistent, pane: wrec?.pane }))
+
+    // W1: idle+alive+persistent mention -> typed wake into the pane
+    const p1 = await I.exec("chat_post", { room: "ops", message: "@worker1 status?" }, host)
+    const d1 = wakeDeliveries.find((c) => c.pane === "terminal_9")
+    check("W1", "@mention of an idle, alive, persistent member types the envelope into its pane",
+      /woke worker1 \(typed into pane terminal_9\)/.test(p1) && !!d1 &&
+        /host pinged you in room "ops"/.test(d1.text) && !/[\r\n]/.test(d1.text), p1)
+
+    // W2: busy blocks wake; events flip it
+    await I.event({ type: "session.status", properties: { sessionID: w, status: { type: "busy" } } })
+    const n2 = wakeDeliveries.length
+    const p2 = await I.exec("chat_post", { room: "ops", message: "@worker1 again" }, host)
+    check("W2a", "busy worker (session.status busy persisted) is NOT woken",
+      readAgents(wt)[w].busy === true && wakeDeliveries.length === n2 && !/woke/.test(p2), p2)
+    await I.event({ type: "session.idle", properties: { sessionID: w } })
+    check("W2b", "session.idle flips the record back to not-busy", readAgents(wt)[w].busy === false)
+
+    // W3: cooldown
+    const n3 = wakeDeliveries.length
+    const p3 = await I.exec("chat_post", { room: "ops", message: "@worker1 third" }, host)
+    check("W3", "wake cooldown suppresses an immediate second ping",
+      wakeDeliveries.length === n3 && !/woke/.test(p3), p3)
+
+    // W4: non-persistent member never wakes
+    const h = "ses_wake_helper__03"
+    ctrl.alive.add(h)
+    delete process.env.AGENTCHAT_NAME
+    delete process.env.AGENTCHAT_ROOM
+    delete process.env.ZELLIJ_PANE_ID
+    await I.exec("chat_status", { status: "transient" }, ctx(h, "be"))
+    await I.exec("chat_room_join", { room: "ops" }, ctx(h, "be"))
+    const n4 = wakeDeliveries.length
+    const helperName = readAgents(wt)[h].name
+    const p4 = await I.exec("chat_post", { room: "ops", message: `@${helperName} hi` }, host)
+    check("W4", "mention of a non-persistent (transient) member never wakes it",
+      wakeDeliveries.length === n4 && !/woke/.test(p4) && readAgents(wt)[h]?.persistent !== true)
+    setWorkerEnv("worker1", "terminal_9") // restore for the W5 block's finally symmetry
+
+    // W5: mention boundary — "@worker2x" must not wake member "worker2"; exact does
+    const w2 = "ses_wake_worker2_04"
+    ctrl.alive.add(w2)
+    setWorkerEnv("worker2", "11") // bare numeric id -> canonicalized terminal_11
+    await I.exec("chat_status", { status: "duty2" }, ctx(w2, "worker"))
+    check("W5a", "bare-numeric ZELLIJ_PANE_ID canonicalizes to terminal_N",
+      readAgents(wt)[w2]?.pane === "terminal_11", readAgents(wt)[w2]?.pane)
+    const n5 = wakeDeliveries.length
+    await I.exec("chat_post", { room: "ops", message: "@worker2x not you" }, host)
+    const p5b = await I.exec("chat_post", { room: "ops", message: "@worker2 you" }, host)
+    check("W5", "mention matching is name-bounded (prefix does not over-wake; exact does)",
+      wakeDeliveries.length === n5 + 1 && /woke worker2/.test(p5b), p5b)
+  } finally {
+    const restore = (k: string, v: string | undefined) => {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    restore("AGENTCHAT_NAME", prevEnv.NAME)
+    restore("AGENTCHAT_ROOM", prevEnv.ROOM)
+    restore("ZELLIJ_PANE_ID", prevEnv.PANE)
+  }
+
+  // W6: exited worker (lease expired, fresh instance) is not woken
+  process.env.AGENTCHAT_STALE_MS = "1"
+  const I2 = await makeInst(wt, ctrl.client, { wake })
+  delete process.env.AGENTCHAT_STALE_MS
+  const w = "ses_wake_worker__02"
+  const ags = readAgents(wt)
+  ags[w].lastSeen = Date.now() - 60_000
+  ags[w].lastWokeAt = 0
+  ags[w].busy = false
+  fs.writeFileSync(path.join(wt, ".agentchat", "agents.json"), JSON.stringify(ags))
+  const p2h = ctx("ses_wake_host2___05", "build")
+  ctrl.alive.add("ses_wake_host2___05")
+  await I2.exec("chat_status", { status: "poster2" }, p2h)
+  await I2.exec("chat_room_join", { room: "ops" }, p2h)
+  const n6 = wakeDeliveries.length
+  const p6 = await I2.exec("chat_post", { room: "ops", message: "@worker1 dead?" }, p2h)
+  check("W6", "lease-expired (exited) worker is not woken",
+    wakeDeliveries.length === n6 && !/woke/.test(p6), p6)
+
+  // W7: wake delivery throw degrades gracefully (post still succeeds)
+  const ags7 = readAgents(wt)
+  ags7[w].lastWokeAt = 0
+  ags7[w].lastSeen = Date.now()
+  fs.writeFileSync(path.join(wt, ".agentchat", "agents.json"), JSON.stringify(ags7))
+  wakeFails = true
+  const p7 = await I.exec("chat_post", { room: "ops", message: "@worker1 wake-fail" }, host)
+  wakeFails = false
+  check("W7", "pane-write failure: post succeeds, wake failure reported, no throw",
+    /Posted to #ops/.test(p7) && /wake worker1: failed/.test(p7), p7)
+
+  // W8: no mention -> no wake
+  const n8 = wakeDeliveries.length
+  await I.exec("chat_post", { room: "ops", message: "plain update, no pings" }, host)
+  check("W8", "post without any mention never delivers a wake", wakeDeliveries.length === n8)
+
+  // W9: AGENTCHAT_WAKE=0 disables waking entirely
+  process.env.AGENTCHAT_WAKE = "0"
+  const I3 = await makeInst(wt, ctrl.client, { wake })
+  delete process.env.AGENTCHAT_WAKE
+  const n9 = wakeDeliveries.length
+  const ags9 = readAgents(wt)
+  ags9["ses_wake_worker2_04"].lastWokeAt = 0
+  ags9["ses_wake_worker2_04"].busy = false
+  ags9["ses_wake_worker2_04"].lastSeen = Date.now()
+  fs.writeFileSync(path.join(wt, ".agentchat", "agents.json"), JSON.stringify(ags9))
+  const pH3 = ctx("ses_wake_host___01", "build")
+  await I3.exec("chat_post", { room: "ops", message: "@worker2 opted-out" }, pH3)
+  check("W9", "AGENTCHAT_WAKE=0 disables wake (opt-out)", wakeDeliveries.length === n9)
+
+  // W10: persistent worker with NO recorded pane -> wake skipped, not attempted
+  const ags10 = readAgents(wt)
+  ags10[w].pane = undefined
+  ags10[w].lastWokeAt = 0
+  ags10[w].busy = false
+  ags10[w].lastSeen = Date.now()
+  fs.writeFileSync(path.join(wt, ".agentchat", "agents.json"), JSON.stringify(ags10))
+  const n10 = wakeDeliveries.length
+  const p10 = await I.exec("chat_post", { room: "ops", message: "@worker1 no-pane" }, host)
+  check("W10", "persistent worker without a recorded pane: wake is skipped (no delivery attempt)",
+    wakeDeliveries.length === n10 && /wake worker1: skipped \(no terminal pane recorded\)/.test(p10), p10)
+}
+
 
 // ====================================================== section register race:
 // concurrent reclaim of a dead-held name from 2 instances (req. 3)
@@ -874,6 +1037,7 @@ async function main() {
   await secLiveness()
     await secSpawn()
   await secRootFallback()
+  await secWake()
   await secRegRace()
   await secCorrupt()
   await secLegacy()

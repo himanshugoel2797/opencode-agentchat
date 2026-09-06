@@ -15,7 +15,7 @@ Every agent session (the main agent or any subagent) automatically gets a **uniq
 | `chat_room_list` | List rooms with purpose, members, last message, your unread count, and your pending invites |
 | `chat_room_join` | Join a room by id/name; accepts a pending invitation; shows what you missed |
 | `chat_invite` | Invite registered agents to a room you're a member of |
-| `chat_post` | Send a message to a room you're in |
+| `chat_post` | Send a message to a room you're in; `@name` mentions wake idle spawned workers so they read and reply |
 | `chat_read` | Read only the messages you haven't seen yet (or the retained history with `include_read`) |
 | `chat_spawn` | Start a **persistent worker**: a new interactive opencode session in a fresh zellij tab, registered under a name you pick (requires running inside zellij) |
 
@@ -35,6 +35,7 @@ All state lives in the project under `.agentchat/`:
 - **Activity** — the plugin watches `tool.execute.before`, so `chat_agents` shows each session's latest tool and when it was active, even without manual status updates.
 - **Liveness is a lease** — every observed request/tool call refreshes a per-session timestamp; a session quiet for ~2 minutes (or explicitly deleted) is shown as `exited` and its name becomes reclaimable. This is deliberate: opencode keeps finished subagents in its database forever, so a server lookup alone can't tell living from dead. Idle-but-open persistent sessions (zellij tabs) stay alive via a 30s heartbeat.
 - **Persistent workers** — `chat_spawn(name, prompt?, room?)` opens a new zellij tab running an interactive `opencode` session on the same project (`opencode . --prompt …`, identity/room pre-set via `AGENTCHAT_NAME`/`AGENTCHAT_ROOM`), so the worker deterministically takes that name and joins that room. It outlives the agent that spawned it and remains reachable via `chat_post`/`chat_read`/`chat_agents`. Requires running inside zellij.
+- **Mention-wake** — an idle spawned worker records its zellij pane, so `chat_post`-ing `@worker-name` types a ping into **its own tab**, waking it to read the room and reply with its own tools. Wakes only target spawned workers that are idle, alive, and past a 60s cooldown; user sessions, transient subagents, and busy workers are never touched, and everything else stays strictly pull-based. Set `AGENTCHAT_WAKE=0` to disable waking entirely.
 - **Invites are pull-based** — an invited agent sees `INVITED` in `chat_room_list` and accepts by calling `chat_room_join`. There is no interruption of other sessions (opencode plugins can't inject into a running turn).
 - **Durability** — atomic writes (temp file + rename), corrupt-state quarantine, and merge-on-save so multiple opencode processes on one project don't clobber each other. Room history keeps the last 1000 messages; per-agent read positions survive trimming exactly.
 - **Works in non-git directories** — state normally lives at the git worktree root; when the project isn't a git repo it falls back to the opened directory (never `/`), so each project still keeps its own rooms and identities.
@@ -86,6 +87,11 @@ captain (inside zellij)
   # -> new tab runs a persistent opencode session named "runner", auto-joined;
   #    it stays reachable after this turn ends:
   chat_post(room: "refactor", message: "start with the flaky trim tests")
+  # worker goes idle after its turn...
+  chat_post(room: "refactor", message: "@runner CI red — take a look")
+  # -> the ping is typed into the runner's own tab, waking it; it reads the
+  #    room and replies from its own session (idle workers only, spawned
+  #    workers only — see docs/MAINTENANCE.md I11)
 ```
 
 ## Development & maintenance
@@ -94,7 +100,7 @@ captain (inside zellij)
 npm install
 npx tsc --noEmit             # typecheck against the pinned plugin SDK
 npx tsx test/smoke.ts        # tool-layer simulation (~1s)
-npx tsx test/stress.ts       # 62 adversarial checks: races, lease liveness, spawn guards, root fallback, corruption (~13s)
+npx tsx test/stress.ts       # 75 adversarial checks: races, lease liveness, spawn + wake guards, root fallback, corruption (~13s)
 npx tsx test/e2e/e2e-live.ts # real `opencode serve` + mock LLM, two live sessions (~15s)
 ```
 
