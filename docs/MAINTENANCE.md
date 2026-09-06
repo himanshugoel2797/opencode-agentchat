@@ -118,7 +118,7 @@ a bug found in adversarial review of v0.1.0)
 | Tool | Args | Behavior / guarantees |
 | --- | --- | --- |
 | `chat_register` | `name?` | No args → identity card. `name` matching `^[A-Za-z0-9_-]{1,32}$`: renames (I5/I6), refuses if an **alive** session holds it, reclaims dead holders. |
-| `chat_agents` | — | All records, sorted; `(you)`, `[exited]`, status or last-activity fallback (`doing:`), rooms. Auto-registers caller. |
+| `chat_agents` | — | All records, sorted; header line `name [type: X]`, then `liveness: alive / exited / (you)` (live via G, fail-open), `doing:` (status, last-activity, `idle`, or `-`), `last seen`, `rooms`. Auto-registers caller. |
 | `chat_status` | `status` | Truncated to 200 chars, timestamped. |
 | `chat_room_create` | `name`, `purpose` | `id = slug(name)`; fails if id exists (same purpose → "join it" hint). Creator joins; first message records purpose. |
 | `chat_room_list` | — | Per room: purpose, members, count, last message, `[member|INVITED]` + `N unread` flags for caller. |
