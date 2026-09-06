@@ -3,7 +3,13 @@
 // Every agent session (primary or subagent) gets a unique name, can create
 // and list chat rooms (each with a stated purpose), invite other agents,
 // join rooms, exchange messages, and see a live directory of what every
-// agent is doing.
+// agent is doing. chat_spawn starts persistent worker sessions in new zellij
+// tabs so long-running agents outlive the session that spawned them.
+//
+// Session liveness is LEASE-BASED: every session stamps its lastSeen as it
+// works (tool execution, bus events, prompts) and persistent sessions
+// heart-beat, so an idle-but-open terminal stays "alive" while finished
+// subagents age out to "exited" after ~2 minutes of silence.
 //
 // State lives in <project>/.agentchat/ so it is shared by all sessions on
 // the project and survives restarts. See docs/MAINTENANCE.md for the state
@@ -24,6 +30,8 @@ type AgentRecord = {
   status: string
   statusAt: number
   registeredAt: number
+  /** last confirmed activity/heartbeat; feeds the liveness lease (see I5) */
+  lastSeen?: number
   /** roomId -> absolute message count already seen (see docs/MAINTENANCE.md) */
   reads: Record<string, number>
 }
@@ -52,16 +60,41 @@ type Room = {
 const NAME_RE = /^[A-Za-z0-9_-]{1,32}$/
 const MAX_MESSAGES = 1000
 const MAX_ACTIVITY = 200
+const STALE_MS = 120_000 // quiet this long -> lease expires, listed as exited
+const HEARTBEAT_MS = 30_000 // persistent sessions re-stamp themselves
+const SEEN_MAX = 400
 
-export default (async ({ client, worktree }: { client: any; worktree: string }) => {
+export default (async ({ client, worktree, $ }: { client: any; worktree: string; $?: any }) => {
   const root = path.join(worktree, ".agentchat")
   const roomsDir = path.join(root, "rooms")
+  const shellHandle = $ ?? undefined
 
   // In-memory activity log, fed by tool.execute.before. Keyed by sessionID.
   const activity = new Map<string, { tool: string; ts: number }>()
 
  // Sessions confirmed gone; dead sessions stay dead, so this is cacheable.
   const deadCache = new Set<string>()
+
+  // Lease bookkeeping. `seen` = every session this process observed doing
+  // work (tools / events / prompts); persistent sessions additionally
+  // self-heartbeat. `parentKind` lets us tell subagents (parentID set) apart
+  // from primary sessions — only primaries may become the heartbeat target.
+  const seen = new Map<string, number>()
+  const parentKind = new Map<string, "primary" | "sub" | "unknown">()
+  let self: string | undefined
+  const staleMs = Number.parseInt(process.env.AGENTCHAT_STALE_MS || "", 10) || STALE_MS
+
+  // Bushook events carry the session id in different places depending on type
+  // (session.* -> properties.info.id; message.* / part.* -> info/part.sessionID).
+  const eventSessionID = (event: { type?: string; properties?: any }): string | undefined => {
+    const p = event.properties
+    if (!p) return undefined
+    if (typeof p.sessionID === "string") return p.sessionID
+    if (p.info?.sessionID) return p.info.sessionID
+    if (p.part?.sessionID) return p.part.sessionID
+    if (p.info?.id) return p.info.id
+    return undefined
+  }
 
   const readJSON = <T,>(file: string, fallback: T): T => {
     let raw: string
@@ -100,34 +133,95 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     return rec
   }
 
+  // A session's lease lives in the in-memory `seen` map (cheap on the busy
+  // event stream) and is flushed to AgentRecord.lastSeen so OTHER processes
+  // on the same worktree agree on its liveness.
+  const saveSeen = (sessionID: string, ts: number) => {
+    const agents = loadAgents()
+    const rec = agents[sessionID]
+    if (rec && (rec.lastSeen ?? 0) < ts) {
+      rec.lastSeen = ts
+      writeJSON(agentsFile(), agents)
+    }
+  }
+
+  const flushSeen = () => {
+    const agents = loadAgents()
+    let dirty = false
+    for (const [id, ts] of seen) {
+      const rec = agents[id]
+      if (rec && (rec.lastSeen ?? 0) < ts) {
+        rec.lastSeen = ts
+        dirty = true
+      }
+    }
+    if (dirty) writeJSON(agentsFile(), agents)
+  }
+
+  const markSeen = (sessionID: string) => {
+    seen.set(sessionID, Date.now())
+    if (seen.size > SEEN_MAX) {
+      flushSeen()
+      while (seen.size > SEEN_MAX) {
+        const oldest = seen.keys().next().value
+        if (oldest === undefined) break
+        seen.delete(oldest)
+      }
+    }
+  }
+
   const takenNames = (agents: Record<string, AgentRecord>): Set<string> =>
     new Set(Object.values(agents).map((a) => a.name))
 
   const sanitize = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 24) || "agent"
 
-  // Lazily register the calling session under a unique default name.
+  // Lazily register the calling session under a unique default name. A
+  // session spawned via chat_spawn claims AGENTCHAT_NAME (deterministic) and
+  // auto-joins AGENTCHAT_ROOM; both env vars are read fresh each call so only
+  // the spawned process is affected.
   const ensureAgent = (ctx: ToolContext): AgentRecord => {
+    markSeen(ctx.sessionID)
     const agents = loadAgents()
     const existing = agents[ctx.sessionID]
-    if (existing) return existing
+    if (existing) {
+      if (!existing.lastSeen) {
+        existing.lastSeen = Date.now()
+        writeJSON(agentsFile(), agents)
+      }
+      maybeAutoJoin(existing)
+      return existing
+    }
     const taken = takenNames(agents)
-    const base = `${sanitize(ctx.agent)}-${ctx.sessionID.slice(-4)}`
+    const envName = (process.env.AGENTCHAT_NAME || "").trim()
+    const wanted =
+      envName &&
+      NAME_RE.test(envName) &&
+      !Object.values(agents).some((a) => a.name === envName && a.sessionID !== ctx.sessionID)
+        ? envName
+        : undefined
+    const base = wanted ?? `${sanitize(ctx.agent)}-${ctx.sessionID.slice(-4)}`
     let name = base
     let n = 2
     while (taken.has(name)) name = `${base}-${n++}`
-    return saveRecord({
+    const rec = saveRecord({
       sessionID: ctx.sessionID,
       name,
       agent: ctx.agent,
       status: "",
       statusAt: 0,
       registeredAt: Date.now(),
+      lastSeen: Date.now(),
       reads: {},
     })
+    maybeAutoJoin(rec)
+    return rec
   }
 
   const sessionAlive = async (sessionID: string): Promise<boolean> => {
     if (deadCache.has(sessionID)) return false
+    const rec = loadAgents()[sessionID]
+    const lastSeen = Math.max(seen.get(sessionID) ?? 0, rec?.lastSeen ?? 0)
+    if (lastSeen > 0 && Date.now() - lastSeen >= staleMs) return false // lease expired
     try {
       const res = await client.session.get({ path: { id: sessionID } })
       if (res?.error || !res?.data) {
@@ -139,6 +233,48 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     }
     return true
   }
+
+  // The session of THIS opencode process (a primary, non-subagent session)
+  // gets heart-beat so an idle-but-open terminal stays alive. Subagents
+  // (parentID set) are never self; probe failures are never self.
+  const classifySelf = async (sessionID: string) => {
+    if (self) return
+    const known = parentKind.get(sessionID)
+    if (known) {
+      if (known === "primary") self = sessionID
+      return
+    }
+    let kind: "primary" | "sub" | "unknown" = "unknown"
+    try {
+      const res = await client.session.get({ path: { id: sessionID } })
+      if (res?.error || !res?.data) {
+        deadCache.add(sessionID)
+        kind = "unknown"
+      } else {
+        kind = res.data.parentID ? "sub" : "primary"
+      }
+    } catch {
+      kind = "unknown"
+    }
+    parentKind.set(sessionID, kind)
+    if (parentKind.size > MAX_ACTIVITY) {
+      const oldest = parentKind.keys().next().value
+      if (oldest !== undefined && oldest !== sessionID) parentKind.delete(oldest)
+    }
+    if (kind === "primary") self = sessionID
+  }
+
+  const heartbeat = () => {
+    const now = Date.now()
+    if (self && !deadCache.has(self)) {
+      seen.set(self, now)
+      saveSeen(self, now)
+    }
+    flushSeen()
+  }
+
+  const heartbeatTimer = setInterval(heartbeat, HEARTBEAT_MS)
+  if (typeof (heartbeatTimer as any)?.unref === "function") (heartbeatTimer as any).unref()
 
   // Room identity is the FILENAME; embedded ids in hand-edited files are
   // never trusted (a crafted id like "../../x" must not reach roomFile()).
@@ -200,6 +336,28 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     return fresh
   }
 
+  // Remove a dead holder's registration: delete its record and purge the name
+  // from every room's members/invites. Caller must have confirmed it isn't alive.
+  const purgeRecord = (holderSessionID: string) => {
+    const agents = loadAgents()
+    const rec = agents[holderSessionID]
+    if (!rec) return
+    delete agents[holderSessionID]
+    writeJSON(agentsFile(), agents)
+    for (const room of allRooms()) {
+      let dirty = false
+      if (room.members.includes(rec.name)) {
+        room.members = room.members.filter((n) => n !== rec.name)
+        dirty = true
+      }
+      if (room.invites.includes(rec.name)) {
+        room.invites = room.invites.filter((n) => n !== rec.name)
+        dirty = true
+      }
+      if (dirty) writeJSON(roomFile(room.id), room)
+    }
+  }
+
   const allRooms = (): Room[] => {
     try {
       return fs
@@ -232,6 +390,20 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     return rooms.length
       ? `No room "${ref}" found. Available: ${rooms.map((r) => `${r.id} ("${r.name}")`).join(", ")}`
       : `No room "${ref}" found and no rooms exist yet. Create one with chat_room_create.`
+  }
+
+  // chat_spawn-child support: auto-join a room given via AGENTCHAT_ROOM (in
+  // the spawned process's env). Ordinary sessions never set it, so this is a
+  // no-op unless the process was spawned as a persistent worker.
+  const maybeAutoJoin = (rec: AgentRecord) => {
+    const ref = (process.env.AGENTCHAT_ROOM || "").trim()
+    if (!ref) return
+    const room = resolveRoom(ref)
+    if (room && !room.members.includes(rec.name)) {
+      mutateRoom(room.id, (r) => {
+        if (!r.members.includes(rec.name)) r.members.push(rec.name)
+      })
+    }
   }
 
   const ago = (ts: number): string => {
@@ -272,7 +444,7 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     description:
       "Set your unique chat name (works for both agents and subagents; yours was auto-assigned on first chat tool use). " +
       "Call with no args to see your current identity. Call with `name` to claim a unique, memorable name " +
-      "(letters, digits, dash, underscore, max 32; names held by exited sessions can be reclaimed). " +
+      "(letters, digits, dash, underscore, max 32; names held by sessions that have been quiet for ~2 minutes can be reclaimed). " +
       "Other agents/subagents address you by this name in invites.",
     args: {
       name: z.string().optional().describe("New unique chat name for this agent"),
@@ -310,22 +482,7 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
         ) {
           return `Name "${name}" was claimed by another agent while you were checking. Pick another.`
         }
-        if (fresh[holder.sessionID]) {
-          delete fresh[holder.sessionID]
-          writeJSON(agentsFile(), fresh)
-        }
-        for (const room of allRooms()) {
-          let dirty = false
-          if (room.members.includes(name)) {
-            room.members = room.members.filter((m) => m !== name)
-            dirty = true
-          }
-          if (room.invites.includes(name)) {
-            room.invites = room.invites.filter((m) => m !== name)
-            dirty = true
-          }
-          if (dirty) writeJSON(roomFile(room.id), room)
-        }
+        purgeRecord(holder.sessionID)
       }
       const old = rec.name
       rec.name = name
@@ -350,8 +507,9 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     description:
       "List every agent and subagent in this project's agentchat directory: unique name, session liveness, " +
       "agent type, what it is doing (its status summary), its most recent activity, and which rooms it is in. " +
-      "Liveness is checked live against the running server, so you can see whether another member is still " +
-      "active or has exited. Use this to find who to invite to a room or who to ask for help.",
+      "Liveness is lease-based: sessions that have gone quiet for ~2 minutes are shown as exited, so finished " +
+      "subagents disappear from the directory automatically while idle-but-open persistent sessions stay alive. " +
+      "Use this to find who to invite to a room or who to ask for help.",
     args: {},
     execute: async (_args, ctx) => {
       const me = ensureAgent(ctx)
@@ -370,12 +528,13 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
           a.status || (act ? `active (last tool: ${act.tool}, ${ago(act.ts)})` : alive ? "idle" : "-")
         const rooms = roomsFor(a.name).map((r) => r.id)
         const status = a.sessionID === me.sessionID ? "alive (you)" : alive ? "alive" : "exited"
+        const seenAt = Math.max(a.lastSeen ?? 0, act?.ts ?? 0, a.statusAt ?? 0)
         lines.push(
           [
             `- ${a.name} [type: ${a.agent}]`,
             `  liveness: ${status}`,
             `  doing: ${doing}`,
-            `  last seen: ${a.status || act ? ago(Math.max(a.statusAt, act?.ts ?? 0)) : "never"}`,
+            `  last seen: ${seenAt ? ago(seenAt) : "never"}`,
             `  rooms: ${rooms.length ? rooms.join(", ") : "(none)"}`,
           ].join("\n"),
         )
@@ -607,6 +766,65 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     },
   })
 
+  const chat_spawn = tool({
+    description:
+      "Spawn a NEW persistent opencode session in a new zellij tab (your terminal must be running inside zellij). " +
+      "The new session joins the project's agentchat directory under the given name (deterministic) and stays " +
+      "reachable in chat rooms even while idle, outliving your current agent/subagent. " +
+      "Talk to it with chat_post / chat_read and see it in chat_agents.",
+    args: {
+      name: z.string().describe("Unique chat name for the spawned worker (letters, digits, dash, underscore, max 32)"),
+      prompt: z.string().optional().describe("Initial instruction for the worker (default: coordinate via the chat tools)"),
+      room: z.string().optional().describe("Room id or name the worker auto-joins on start"),
+    },
+    execute: async (args, ctx) => {
+      ensureAgent(ctx)
+      const name = args.name.trim()
+      if (!NAME_RE.test(name)) {
+        return `Invalid name "${args.name}". Use 1-32 chars: letters, digits, dash, underscore.`
+      }
+      if (!process.env.ZELLIJ) {
+        return "chat_spawn requires zellij: start zellij, then run this from inside a zellij pane/tab."
+      }
+      let room: Room | undefined
+      if (args.room && args.room.trim()) {
+        room = resolveRoom(args.room.trim())
+        if (!room) return roomListError(args.room)
+      }
+      const holder = Object.values(loadAgents()).find((a) => a.name === name && a.sessionID !== ctx.sessionID)
+      if (holder) {
+        if (await sessionAlive(holder.sessionID)) {
+          return `Name "${name}" is held by a live agent. Pick another name, or reuse it once it has been quiet for ~2 minutes.`
+        }
+        const fresh = loadAgents()
+        if (
+          Object.values(fresh).some(
+            (a) => a.name === name && a.sessionID !== ctx.sessionID && a.sessionID !== holder.sessionID,
+          )
+        ) {
+          return `Name "${name}" was claimed by another agent while you were checking. Pick another.`
+        }
+        purgeRecord(holder.sessionID)
+      }
+      const prompt =
+        (args.prompt && args.prompt.trim()) ||
+        `Act as the persistent project worker registered as "${name}". Use the chat tools (chat_room_list, chat_room_join, chat_status, chat_post, chat_read) to coordinate; stay available to take tasks.`
+      const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
+      const inner = `cd -- ${shq(worktree)} && AGENTCHAT_NAME=${shq(name)}${room ? ` AGENTCHAT_ROOM=${shq(room.id)}` : ""} exec opencode ${shq(prompt)}`
+      const cmd = `zellij action new-tab --name ${shq(name)} -- zsh -lc ${shq(inner)}`
+      if (!shellHandle) {
+        return `[dry-run: this process has no inline zellij runner]\nwould run: ${cmd}`
+      }
+      const out = await shellHandle.nothrow().quiet().cwd(worktree)`${cmd}`
+      if (out?.exitCode && out.exitCode !== 0) {
+        const err = String(out.stderr?.toString?.() ?? "").slice(0, 500)
+        return `zellij failed (exit ${out.exitCode}): ${err}`
+      }
+      const head = `Spawned persistent worker "${name}" in a new zellij tab. It registers under AGENTCHAT_NAME on its first chat tool use.${room ? ` Auto-joined room "${room.id}".` : ""}`
+      return `${head}\nTalk to it with chat_post / chat_read; watch it in chat_agents.`
+    },
+  })
+
   return {
     tool: {
       chat_register,
@@ -618,14 +836,18 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
       chat_invite,
       chat_post,
       chat_read,
+      chat_spawn,
     },
 
     event: async ({ event }: { event: { type: string; properties?: any } }) => {
+      const live = eventSessionID(event)
+      if (live) markSeen(live)
       if (event.type === "session.deleted") {
-        const id: string | undefined = event.properties?.info?.id
+        const id: string | undefined = event.properties?.info?.id ?? event.properties?.sessionID
         if (!id) return
         deadCache.add(id)
         activity.delete(id)
+        seen.delete(id)
         const agents = loadAgents()
         if (agents[id]) {
           delete agents[id]
@@ -643,11 +865,17 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
         if (oldest !== undefined && oldest !== input.sessionID) activity.delete(oldest)
       }
       deadCache.delete(input.sessionID)
+      markSeen(input.sessionID)
+      void classifySelf(input.sessionID)
     },
 
     // Advertise the coordination system (and the caller's identity) in the
     // system prompt so every agent knows the chat tools exist.
     "experimental.chat.system.transform": async (input: { sessionID?: string }, output: { system: string[] }) => {
+      if (input.sessionID) {
+        markSeen(input.sessionID)
+        void classifySelf(input.sessionID)
+      }
       const lines = [
         "# Agent coordination (agentchat)",
         "Chat tools are available so agents and subagents working on this project can coordinate instead of working blind:",
@@ -657,6 +885,7 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
         "- chat_post / chat_read: exchange messages in rooms you are a member of.",
         "- chat_status(status): publish what you are doing so others can see it.",
         "- chat_register(name): claim or check your unique chat name.",
+        "- chat_spawn(name, ...): start a persistent worker session in a new zellij tab.",
       ]
       if (input.sessionID) {
         const rec = loadAgents()[input.sessionID]

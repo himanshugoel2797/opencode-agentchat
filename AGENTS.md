@@ -18,7 +18,12 @@ upgrade (§6).
 - No dependency on `zod` imports: use `tool.schema` (zod v4 namespace, no
   nested `.z`). No build step: ship `index.ts` as-is.
 - The plugin must never prompt or inject into other sessions (pull-based
-  invites only).
+  invites only). `chat_spawn` starts sessions the *user* sees, via zellij
+  tabs — never a headless hidden process.
+- Liveness is the I5 **lease** (stamp via `markSeen` on every observed event,
+  tool call, and chat request; 30s self-heartbeat). Never regress to treating
+  the server's session list as liveness — finished subagents persist there
+  forever.
 - Schema changes must stay loadable via `normalizeRoom` (backward-compat
   backfill), not migrations.
 

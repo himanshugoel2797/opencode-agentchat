@@ -325,6 +325,7 @@ async function secLiveness() {
     thr: "ses_liv_thr___0004",
     gon: "ses_liv_gon___0005",
     gn2: "ses_liv_gn2___0006",
+    sleep: "ses_liv_sleep_007",
   }
   for (const id of Object.values(sess)) ctrl.alive.add(id)
   ctrl.throwing.add(sess.thr) // client THROWS for the thrower session
@@ -351,6 +352,18 @@ async function secLiveness() {
     /- zombie \[type: vic\]\n\s+liveness: exited/.test(agentsOut), agentsOut)
   const aliveEntry = (agentsOut.match(/- prim \[type: build\]\n\s+liveness: ([^\n]+)/) || [])[1] || ""
   check("04a2", "live session shows liveness: alive in chat_agents", /alive/.test(aliveEntry), aliveEntry)
+
+  // [04a3] lease expiry: a session that just went quiet is STILL listed by the
+  // server (real finished subagents persist forever) but its expired lease must
+  // mark it exited. Read via instance 2, which never observed the session and
+  // therefore trusts the on-disk lease.
+  await I1.exec("chat_status", { status: "sleepy" }, c("sleep", "sleep"))
+  const agLease = readAgents(wt)
+  agLease[sess.sleep].lastSeen = Date.now() - 10 * 60 * 1000
+  fs.writeFileSync(path.join(wt, ".agentchat", "agents.json"), JSON.stringify(agLease))
+  const agentsOutLease = await I2.exec("chat_agents", {}, c("prim", "build"))
+  check("04a3", "quiet session (lease expired but still listed by server) -> liveness: exited",
+    /liveness: exited\s+doing: -/.test(agentsOutLease), agentsOutLease.slice(0, 300))
 
   const invDead = await I1.exec("chat_invite", { room: "pub", agents: ["zombie"] }, c("prim", "build"))
   check("04b", "chat_invite to exited session rejects with 'session has exited'",
@@ -401,6 +414,76 @@ async function secLiveness() {
   const agentsI1c = await I1.exec("chat_agents", {}, c("prim", "build"))
   check("05d", "event fired via instance2 also prunes for instance1 (disk-backed)",
     !readAgents(wt)[sess.gn2] && !agentsI1c.includes(gone2Name))
+}
+
+// ======================================================== section spawn:
+// chat_spawn guards + deterministic AGENTCHAT_NAME/AGENTCHAT_ROOM (persistent
+// workers in zellij tabs)
+async function secSpawn() {
+  console.log("\n--- section SPAWN ---")
+  const wt = mkwt("spawn")
+  const ctrl = makeClient()
+  const I1 = await makeInst(wt, ctrl.client)
+  const I2 = await makeInst(wt, ctrl.client) // dry-run + stale-lease mix via a "fresh" process
+  const ctx = makeCtx(wt)
+  const host = ctx("ses_spawn_host_001", "build")
+  ctrl.alive.add("ses_spawn_host_001")
+  await I1.exec("chat_register", { name: "host" }, host)
+  await I1.exec("chat_room_create", { name: "ops", purpose: "ops room" }, host)
+
+  const noZ = await I1.exec("chat_spawn", { name: "worker1", room: "ops" }, host)
+  check("SP1", "chat_spawn outside zellij is refused",
+    /requires zellij/.test(noZ), noZ)
+
+  const prev = { NAME: process.env.AGENTCHAT_NAME, ROOM: process.env.AGENTCHAT_ROOM }
+  try {
+    process.env.AGENTCHAT_NAME = "worker1"
+    process.env.AGENTCHAT_ROOM = "ops"
+    const w = "ses_spawn_w1_0002"
+    ctrl.alive.add(w)
+    const out1 = await I1.exec("chat_status", { status: "on duty" }, ctx(w, "worker"))
+    const rec = readAgents(wt)[w]
+    check("SP2a", "AGENTCHAT_NAME env gives the spawned worker a deterministic chat name",
+      /Status updated/.test(out1) && rec?.name === "worker1", `rec=${JSON.stringify(rec)} out=${out1}`)
+    const hq = readRoom(wt, "ops")
+    check("SP2b", "AGENTCHAT_ROOM env auto-joins the spawned worker",
+      hq.members.includes("worker1"), `members=${JSON.stringify(hq.members)}`)
+  } finally {
+    if (prev.NAME === undefined) delete process.env.AGENTCHAT_NAME
+    else process.env.AGENTCHAT_NAME = prev.NAME
+    if (prev.ROOM === undefined) delete process.env.AGENTCHAT_ROOM
+    else process.env.AGENTCHAT_ROOM = prev.ROOM
+  }
+
+  process.env.ZELLIJ = "1"
+  try {
+    // stale holder: register + join, then backdate the lease on disk.
+    const stale = "ses_spawn_stale_003"
+    ctrl.alive.add(stale)
+    await I1.exec("chat_status", { status: "ghost" }, ctx(stale, "ghost"))
+    await I1.exec("chat_room_join", { room: "ops" }, ctx(stale, "ghost"))
+    const ghostName = readAgents(wt)[stale].name
+    const ag = readAgents(wt)
+    ag[stale].lastSeen = Date.now() - 10 * 60 * 1000
+    fs.writeFileSync(path.join(wt, ".agentchat", "agents.json"), JSON.stringify(ag))
+
+    // I2 has never observed `stale`, so it sees the expired lease: purge + dry-run.
+    const dry = await I2.exec("chat_spawn", { name: ghostName, room: "ops" }, host)
+    check("SP3a", "spawn over a stale holder purges the dead record and its room membership",
+      !readAgents(wt)[stale] && !readRoom(wt, "ops").members.includes(ghostName) &&
+        /\[dry-run/.test(dry),
+      dry.slice(0, 200))
+    check("SP3b", "dry-run (no inline runner) exposes the exact zellij+env command",
+      new RegExp(`zellij action new-tab --name '${ghostName}'`).test(dry) && /AGENTCHAT_NAME=/.test(dry) &&
+        /AGENTCHAT_ROOM=.*ops/.test(dry) && /exec opencode/.test(dry),
+      dry.slice(0, 300))
+
+    const took = await I2.exec("chat_spawn", { name: "worker1" }, host)
+    check("SP3c", "spawn refuses a name held by a live agent",
+      /held by a live agent/.test(took), took)
+  } finally {
+    delete process.env.ZELLIJ
+  }
 }
 
 // ====================================================== section register race:
@@ -743,8 +826,8 @@ async function secActivity() {
   const activeN = count(out, /doing: active \(last tool: dummy-t/g)
   const neverN = count(out, /last seen: never/g)
   const idleN = count(out, /doing: idle/g)
-  check("11", "activity map bounded at MAX_ACTIVITY=200: 200 sessions show activity, 50 evicted fall back to idle/'last seen: never' without crash",
-    !threw && activeN === 200 && neverN === 50 && idleN === 50,
+  check("11", "activity map bounded at MAX_ACTIVITY=200: 200 sessions show activity, 50 evicted fall back to idle with lease-backed 'last seen' (no 'never') without crash",
+    !threw && activeN === 200 && idleN === 50 && neverN === 0,
     `threw=${threw} active=${activeN} never=${neverN} idle=${idleN}`)
 }
 
@@ -754,6 +837,7 @@ async function main() {
   await secRace()
   await secLimits()
   await secLiveness()
+  await secSpawn()
   await secRegRace()
   await secCorrupt()
   await secLegacy()

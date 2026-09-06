@@ -8,18 +8,20 @@ upgraded. Read this before changing anything.
 ## 1. What the plugin does
 
 Gives every opencode agent session (primary agents and subagents) a unique
-chat identity and 9 tools (`chat_*`) to coordinate through project-scoped chat
-rooms. All state is plain JSON on disk under `<worktree>/.agentchat/`, shared
-by every opencode process opened on the same worktree. No network service, no
-database, no dependencies beyond `@opencode-ai/plugin`.
+chat identity and 10 tools (`chat_*`) to coordinate through project-scoped chat
+rooms. Liveness is lease-based (quiet ~2 min → considered exited), and
+`chat_spawn` starts persistent worker sessions in new zellij tabs. All state is
+plain JSON on disk under `<worktree>/.agentchat/`, shared by every opencode
+process opened on the same worktree. No network service, no database, no
+dependencies beyond `@opencode-ai/plugin`.
 
 ## 2. File map
 
 | Path | Role |
 | --- | --- |
-| `index.ts` | Entire plugin: types, state helpers, 9 tools, 3 hooks. Single file by design. |
+| `index.ts` | Entire plugin: types, state helpers, 10 tools, 3 hooks + heartbeat timer. Single file by design. |
 | `test/smoke.ts` | Tool-layer simulation: 3 fake agent sessions + fake `client` drive the real tool `execute` functions against a temp worktree. Fast (~1s). |
-| `test/stress.ts` | Adversarial stress/edge suite (53 checks): multi-instance races on one worktree, liveness/death lifecycle, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~10s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). |
+| `test/stress.ts` | Adversarial stress/edge suite (60 checks): multi-instance races on one worktree, lease liveness/death lifecycle, `chat_spawn` guards + deterministic worker names, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~10s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). |
 | `test/e2e/e2e-live.ts` | TRUE end-to-end: boots a mock OpenAI-compatible LLM + real `opencode serve` in a fully isolated env (`XDG_CONFIG_HOME` **and `HOME`** overridden — opencode loads legacy `~/.opencode` regardless of XDG; keep HOME fake), then drives two real sessions through scripted `tool_calls` and asserts on-disk state + tool outputs captured from SSE. ~11s warm / ~60s cold. See `test/e2e/FINDINGS.md`. |
 | `test/FINDINGS-STRESS.md`, `test/e2e/FINDINGS.md` | Bug reports from adversarial passes; keep as history + severity rationale. Both reported bugs are fixed (their checks are now hard assertions). |
 | `docs/MAINTENANCE.md` | This file. |
@@ -41,6 +43,7 @@ Object keyed by **sessionID**:
     "status": "coordinating",     // manual summary from chat_status
     "statusAt": 1770000000000,
     "registeredAt": 1769999000000,
+    "lastSeen": 1770000123000,    // lease: refreshed by any observed activity (I5)
     "reads": { "refactor": 1003 } // roomId -> ABSOLUTE cursor (see I1)
   }
 }
@@ -84,16 +87,25 @@ a bug found in adversarial review of v0.1.0)
 - **I4 — all agent-record writes go through `saveRecord(rec)`**, which
   re-reads and merge-overwrites by sessionID (never blind whole-map
   overwrite; v0.1.0 clobbered concurrent registrations).
-- **I5 — name liveness.** A name blocks claiming only while its holder's
-  session is alive (`client.session.get`, dead = error/absent, cached in
-  `deadCache` forever — opencode session ids never revive; queries fail
-  **open** when the client errors). On reclaiming a dead name, the holder's
-  record is deleted **and the dead name is purged from every room's
-  members/invites** before the rename. **After the liveness `await`,
-  `chat_register` MUST re-read `agents.json` and re-check the claim**
-  (excluding self and the dead holder) before writing — everything after
-  that point is synchronous. Omitting the recheck reintroduced a
-  double-claim race (FINDINGS-STRESS Bug 1, regression check `03`).
+- **I5 — name liveness is a LEASE.** opencode never deletes finished
+  subagents from SQLite and `session.get` keeps returning them, so the server
+  list is NOT a liveness signal. Instead: any observed activity (tool
+  execution, chat request, chat tool call) stamps an in-memory `seen` map
+  (`markSeen`) and the record's `lastSeen` on disk (throttled flushes + a
+  self-heartbeat every `HEARTBEAT_MS = 30s`, unref'd timer). A session is
+  **dead** if (a) `session.deleted` marked it (deadCache, permanent — opencode
+  ids never revive), or (b) its lease is `>= STALE_MS = 120s` old (in-memory
+  `seen` first, then disk `lastSeen`); only fresh leases get the
+  `client.session.get` probe, and probe failures **fail open** (alive). Env
+  override `AGENTCHAT_STALE_MS` (for tests). A name/holder is reclaimable once
+  dead: `purgeRecord()` deletes the record **and sweeps the name from every
+  room's members/invites**. **After the liveness `await`, `chat_register` and
+  `chat_spawn` MUST re-read `agents.json` and re-check the claim** (excluding
+  self and the dead holder) before purging — everything after that point is
+  synchronous. Omitting the recheck reintroduced a double-claim race
+  (FINDINGS-STRESS Bug 1, regression check `03`). Lease tests must read
+  through an instance that never saw the session (the in-memory map defeats a
+  backdated disk stamp) — see stress checks `04a3`/`SP3`.
 - **I6 — renames** (`chat_register name=`) sweep `members`/`invites` in all
   rooms. Message history and read cursors intentionally keep working:
   history stores the old name as a label; cursors are keyed by room id.
@@ -117,8 +129,8 @@ a bug found in adversarial review of v0.1.0)
 
 | Tool | Args | Behavior / guarantees |
 | --- | --- | --- |
-| `chat_register` | `name?` | No args → identity card. `name` matching `^[A-Za-z0-9_-]{1,32}$`: renames (I5/I6), refuses if an **alive** session holds it, reclaims dead holders. |
-| `chat_agents` | — | All records, sorted; header line `name [type: X]`, then `liveness: alive / exited / (you)` (live via G, fail-open), `doing:` (status, last-activity, `idle`, or `-`), `last seen`, `rooms`. Auto-registers caller. |
+| `chat_register` | `name?` | No args → identity card. `name` matching `^[A-Za-z0-9_-]{1,32}$`: renames (I5/I6), refuses if a lease-**alive** session holds it, reclaims dead holders (I5 recheck + `purgeRecord`). Honors `AGENTCHAT_NAME` at first registration (spawned workers). |
+| `chat_agents` | — | All records, sorted; header line `name [type: X]`, then `liveness: alive / exited / (you)` (lease per I5, fail-open), `doing:` (status, last-activity, `idle`, or `-`), `last seen` (`max(lastSeen, activity.ts, statusAt)`), `rooms`. Auto-registers caller. |
 | `chat_status` | `status` | Truncated to 200 chars, timestamped. |
 | `chat_room_create` | `name`, `purpose` | `id = slug(name)`; fails if id exists (same purpose → "join it" hint). Creator joins; first message records purpose. |
 | `chat_room_list` | — | Per room: purpose, members, count, last message, `[member|INVITED]` + `N unread` flags for caller. |
@@ -126,6 +138,7 @@ a bug found in adversarial review of v0.1.0)
 | `chat_invite` | `room`, `agents[]` | Caller must be member. Per-target outcome lines. Rejects unknown names and exited sessions (I5). Invite recorded as a system message in the room. **Pull-based**: invitee must call `chat_room_join`; the plugin must never inject into other sessions' turns. |
 | `chat_post` | `room`, `message` | Caller must be member. 4000-char cap. Poster auto-marks the room read at their own message. |
 | `chat_read` | `room`, `include_read?` | Caller must be member. Default: unseen only; advances cursor as a side effect. `include_read` → retained history (subject to I1 trim). |
+| `chat_spawn` | `name`, `prompt?`, `room?` | Requires `$` (BunShell) and `ZELLIJ` env; outside zellij → refusal string. Reclaims a stale name holder (I5 recheck + `purgeRecord`), refuses a lease-alive holder. Runs `zellij action new-tab --name <n> -- zsh -lc "cd <worktree> && AGENTCHAT_NAME=<n> [AGENTCHAT_ROOM=<id>] exec opencode <prompt>"` (everything shell-quoted via `shq`). The child claims its name/room deterministically in `ensureAgent` (`AGENTCHAT_ROOM` auto-joins via `maybeAutoJoin`). No `$` (test harness) → returns the exact `[dry-run]` command instead. |
 
 Room refs accept exact id, exact name, then case-insensitive name; failures
 list available rooms.
@@ -142,9 +155,11 @@ and this table, re-run §7, and note the change in git history.
 | B | `tool` hook keys = **raw tool ids** | `chat_post` reaches the model unprefixed (no `plugin_` namespace). Verified by inspecting the opencode binary's registry wiring (`Object.entries(…plugin.tool…)` uses keys verbatim; only MCP tools are prefixed `server_tool`). If a future version namespaces them, update every `chat_*` mention in descriptions and the §7 prompt block. | `grep -a "chat_post" $(which opencode)` is not conclusive — check in a live session: ask the agent to call `chat_room_list` with no args. |
 | C | `ToolContext` fields | `sessionID`, `agent`, `messageID`, `directory`, `worktree`, `abort`, `metadata`, `ask` exist on every tool execute. Identity is keyed on `sessionID`; display default is `<agent>-<sessionID suffix>`. | Typecheck against bumped SDK (`index.ts` imports `ToolContext`). |
 | D | `tool.execute.before` | Fires for **plugin-defined tools too**, with `{tool, sessionID}` — this powers activity tracking. | Live session: call a chat tool, then `chat_agents` should show it as last activity. |
-| E | `experimental.chat.system.transform` | Signature `(input:{sessionID?,model}, output:{system})`; called on **every** chat request, including hidden agents (title/summary/compaction) and one agent-generation site **without sessionID** (guard exists — keep it). `output.system` is rebuilt per request, so mutating per call does not accumulate. **Hard requirement:** never leave `output.system` with >1 entry — opencode emits each entry as its own `system`-role message, and SGLang/vLLM reject any `system` message that is not the first ("System message must be at the beginning."). Merge the block into `output.system[0]` (or push only when the array is empty), as the current impl does. | Typecheck; live: ask an agent "what is your chat name" — the prompt block must be reaching it. e2e-live asserts single-system-at-start on every mock request. If renamed/removed, move the guidance into tool descriptions only. |
-| F | `event` hook | `session.deleted` → `properties.info.id`; we prune the record and mark the name reclaimable. If the event name/payload changes, dead names simply stop auto-pruning (graceful). | Live: delete a throwaway session, check `.agentchat/agents.json` on next use. |
-| G | `client.session.get` | `client.session.get({ path: { id } })` returns a result tuple; liveness = `!error && !!data`. Fail-open on thrown errors. | Typecheck `client` usage (currently typed `any` on purpose); live: `chat_agents` should not mark everyone exited. |
+| E | `experimental.chat.system.transform` | Signature `(input:{sessionID?,model}, output:{system})`; called on **every** chat request, including hidden agents (title/summary/compaction) and one agent-generation site **without sessionID** (guard exists — keep it). We also stamp the lease + classify self (primary vs sub) here, so the heartbeat works for sessions that only chat. `output.system` is rebuilt per request, so mutating per call does not accumulate. **Hard requirement:** never leave `output.system` with >1 entry — opencode emits each entry as its own `system`-role message, and SGLang/vLLM reject any `system` message that is not the first ("System message must be at the beginning."). Merge the block into `output.system[0]` (or push only when the array is empty), as the current impl does. | Typecheck; live: ask an agent "what is your chat name" — the prompt block must be reaching it. e2e-live asserts single-system-at-start on every mock request. If renamed/removed, move the guidance into tool descriptions only. |
+| F | `event` hook | Event payload shapes (verified in SDK `types.gen.d.ts`): `session.deleted` → `properties.info.id`; `session.status`/`session.idle` → `properties.sessionID`; `message.updated` → `properties.info.sessionID`; `message.part.updated` → `properties.part.sessionID`. We use the latter to **stamp the lease** (`eventSessionID` helper checks all four shapes — keep it updated if events are renamed), and `session.deleted` to prune the record permanently (deadCache). If event names/payloads change, leases stop extending via events (graceful; tool/system hooks still stamp). | Live: run any tool in another session; check `lastSeen` in `.agentchat/agents.json` moves. Delete a throwaway session, check its record vanishes from `agents.json` on next use. |
+| G | `client.session.get` | `client.session.get({ path: { id } })` returns a result tuple; probe = `!error && !!data`. Used ONLY for fresh-lease sessions (I5); thrown errors fail open (alive). NOTE: finished subagents stay listed forever — never treat the list as liveness by itself. | Typecheck `client` usage (currently typed `any` on purpose); live: `chat_agents` should not mark everyone exited, and a finished subagent should disappear after ~2 quiet minutes. |
+| G2 | `PluginInput.$` (BunShell) | `chat_spawn` shells out through the plugin-provided `$` (with `.nothrow().quiet().cwd()`). If a future version drops `$`, chat_spawn degrades to its dry-run message — verify `$` presence in a live session after upgrades. | Stress `SP3b` pins the emitted command shape; live: spawn in zellij and watch a new tab open. |
+| G3 | `setInterval` heartbeat | Plugin process may outlive sessions; timer is `unref()`d and persists `lastSeen` + flushes `seen` every 30s. If the bun host freezes timers for idle plugins, leases expire too eagerly → `AGENTCHAT_STALE_MS` makes this testable. | Live: keep one session idle >2 min in a room, confirm `chat_agents` from another session still shows it alive after ~30s heartbeats. |
 | H | `tool.schema` | Is the zod **v4** classic namespace — call `z.string()` on it directly; there is **no nested `.z` export** and do not import `zod` separately (version skew). | Typecheck; smoke test. |
 | I | Tool result | Returning a plain string is a valid `ToolResult`. | Smoke test. |
 | J | State dir writable | `.agentchat/` is created lazily under `worktree`. Unwritable fs surfaces as a tool error — acceptable, don't add silent fallbacks. | Manual. |
@@ -155,7 +170,7 @@ and this table, re-run §7, and note the change in git history.
 npm install
 npx tsc --noEmit          # types vs the pinned SDK
 npx tsx test/smoke.ts     # ~1s   tool-layer happy-path + trim/cursor basics
-npx tsx test/stress.ts    # ~10s  53 adversarial checks (races, liveness, corrupt, legacy, boundaries, refs)
+npx tsx test/stress.ts    # ~10s  60 adversarial checks (races, lease liveness, spawn guards, corrupt, legacy, boundaries, refs)
 npx tsx test/e2e/e2e-live.ts   # ~11s warm / ~60s cold — REAL opencode serve + scripted mock LLM
 ```
 
@@ -169,7 +184,7 @@ bug). When you fix any new bug, add a step to smoke or stress first.
 `test/e2e/e2e-live.ts` is the authoritative check for the §6 live surfaces —
 it proves B (raw tool ids reach the model), D (`tool.execute.before` fires
 for plugin tools), E (system prompt block reaches sessions), G
-(`session.idle`/liveness) without a real LLM. Notes for keeping it green:
+(lease liveness stamping via real requests) without a real LLM. Notes for keeping it green:
 
 - Isolation needs BOTH `XDG_CONFIG_HOME` and `HOME` overridden (opencode
   still loads legacy `~/.opencode` otherwise).
@@ -199,6 +214,9 @@ see git history of this section (pre-0.2 checklist).
   from I3/I4 re-reads + atomic renames. No locks; last-writer-wins for
   non-mergeable fields is an accepted trade-off.
 - **Fail-open liveness.** A failing `session.get` must never block invites.
+  Liveness is deliberately a quiet-lease, not a process list: opencode keeps
+  finished subagents in SQLite forever, and idle-but-open persistent sessions
+  (e.g. zellij tabs) must remain "alive".
 - **State in the project tree** (not global) so parallel sessions and git
   users share/inspect it. `.agentchat/` is gitignored *in this repo only*;
   users decide for their own projects.
@@ -224,3 +242,5 @@ If published to npm, the README install becomes
 - Read receipts are per-record cursors only (no cross-device sync beyond the shared tree).
 - `MAX_MESSAGES` history is lossy by design; a future version could spill trimmed messages to `rooms/<id>.archive.jsonl` (keep absolute `i` when you do).
 - Slug-only room identity means "Auth refactor" and "auth-refactor" collide; message-history rename labels are not disambiguated.
+- `chat_spawn` only works inside zellij (no tmux/no-terminal fallback yet); spawned workers are full interactive sessions, not headless — the user closes their tabs.
+- A spawned worker that never calls a chat tool holds no lease and only stays "alive" via its heartbeat while the process runs; if opencode suspends plugin timers, expect it to show exited until it next acts.
