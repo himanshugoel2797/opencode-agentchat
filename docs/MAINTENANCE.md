@@ -19,7 +19,7 @@ database, no dependencies beyond `@opencode-ai/plugin`.
 | --- | --- |
 | `index.ts` | Entire plugin: types, state helpers, 9 tools, 3 hooks. Single file by design. |
 | `test/smoke.ts` | Tool-layer simulation: 3 fake agent sessions + fake `client` drive the real tool `execute` functions against a temp worktree. Fast (~1s). |
-| `test/stress.ts` | Adversarial stress/edge suite (52 checks): multi-instance races on one worktree, liveness/death lifecycle, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~10s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). |
+| `test/stress.ts` | Adversarial stress/edge suite (53 checks): multi-instance races on one worktree, liveness/death lifecycle, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~10s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). |
 | `test/e2e/e2e-live.ts` | TRUE end-to-end: boots a mock OpenAI-compatible LLM + real `opencode serve` in a fully isolated env (`XDG_CONFIG_HOME` **and `HOME`** overridden — opencode loads legacy `~/.opencode` regardless of XDG; keep HOME fake), then drives two real sessions through scripted `tool_calls` and asserts on-disk state + tool outputs captured from SSE. ~11s warm / ~60s cold. See `test/e2e/FINDINGS.md`. |
 | `test/FINDINGS-STRESS.md`, `test/e2e/FINDINGS.md` | Bug reports from adversarial passes; keep as history + severity rationale. Both reported bugs are fixed (their checks are now hard assertions). |
 | `docs/MAINTENANCE.md` | This file. |
@@ -155,7 +155,7 @@ and this table, re-run §7, and note the change in git history.
 npm install
 npx tsc --noEmit          # types vs the pinned SDK
 npx tsx test/smoke.ts     # ~1s   tool-layer happy-path + trim/cursor basics
-npx tsx test/stress.ts    # ~10s  52 adversarial checks (races, liveness, corrupt, legacy, boundaries, refs)
+npx tsx test/stress.ts    # ~10s  53 adversarial checks (races, liveness, corrupt, legacy, boundaries, refs)
 npx tsx test/e2e/e2e-live.ts   # ~11s warm / ~60s cold — REAL opencode serve + scripted mock LLM
 ```
 

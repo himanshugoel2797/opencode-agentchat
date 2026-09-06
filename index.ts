@@ -270,10 +270,10 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_register = tool({
     description:
-      "Set your unique chat name (agents/subagents each have one; yours was auto-assigned on first chat tool use). " +
+      "Set your unique chat name (works for both agents and subagents; yours was auto-assigned on first chat tool use). " +
       "Call with no args to see your current identity. Call with `name` to claim a unique, memorable name " +
       "(letters, digits, dash, underscore, max 32; names held by exited sessions can be reclaimed). " +
-      "Other agents address you by this name in invites.",
+      "Other agents/subagents address you by this name in invites.",
     args: {
       name: z.string().optional().describe("New unique chat name for this agent"),
     },
@@ -348,17 +348,18 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_agents = tool({
     description:
-      "List every agent/subagent in this project's agentchat directory: unique name, agent type, " +
-      "what it is doing (its status summary), its most recent activity, and which rooms it is in. " +
-      "Use this to find who to invite to a room or who to ask for help.",
+      "List every agent and subagent in this project's agentchat directory: unique name, session liveness, " +
+      "agent type, what it is doing (its status summary), its most recent activity, and which rooms it is in. " +
+      "Liveness is checked live against the running server, so you can see whether another member is still " +
+      "active or has exited. Use this to find who to invite to a room or who to ask for help.",
     args: {},
     execute: async (_args, ctx) => {
       const me = ensureAgent(ctx)
       const list = Object.values(loadAgents()).sort((a, b) => a.name.localeCompare(b.name))
       if (list.length === 1) {
         return [
-          `You are the only agent registered so far: "${me.name}" (type ${me.agent}).`,
-          "Other agents appear here as soon as they use any chat tool.",
+          `You are the only agent/subagent registered so far: "${me.name}" (type ${me.agent}).`,
+          "Others appear here as soon as they use any chat tool.",
         ].join("\n")
       }
       const lines: string[] = []
@@ -366,13 +367,15 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
         const alive = await sessionAlive(a.sessionID)
         const act = activity.get(a.sessionID)
         const doing =
-          a.status || (act ? `active (last tool: ${act.tool}, ${ago(act.ts)})` : alive ? "idle" : "exited")
+          a.status || (act ? `active (last tool: ${act.tool}, ${ago(act.ts)})` : alive ? "idle" : "-")
         const rooms = roomsFor(a.name).map((r) => r.id)
+        const status = a.sessionID === me.sessionID ? "alive (you)" : alive ? "alive" : "exited"
         lines.push(
           [
-            `- ${a.name}${a.sessionID === me.sessionID ? " (you)" : ""} [type: ${a.agent}]${alive ? "" : " [exited]"}`,
+            `- ${a.name} [type: ${a.agent}]`,
+            `  liveness: ${status}`,
             `  doing: ${doing}`,
-            `  last seen: ${ago(Math.max(a.statusAt, act?.ts ?? 0))}`,
+            `  last seen: ${a.status || act ? ago(Math.max(a.statusAt, act?.ts ?? 0)) : "never"}`,
             `  rooms: ${rooms.length ? rooms.join(", ") : "(none)"}`,
           ].join("\n"),
         )
@@ -383,7 +386,8 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_status = tool({
     description:
-      "Publish a one-line summary of what you are currently doing, so other agents can see it via chat_agents. " +
+      "Publish a one-line summary of what you (an agent or subagent) are currently doing, so other " +
+      "agents and subagents can see it via chat_agents. " +
       "Update it at meaningful milestones (starting a task, blocked, finished). Keep it short.",
     args: {
       status: z.string().describe('Short summary, e.g. "implementing auth middleware" or "blocked: need API schema"'),
@@ -399,8 +403,9 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_room_create = tool({
     description:
-      "Create a project chat room with a stated purpose (who it is for, what it is about). " +
-      "You automatically join it. Invite the agents you want with chat_invite. The room id is the " +
+      "Create a project chat room (works for agents and subagents alike) with a stated purpose " +
+      "(who it is for, what it is about). " +
+      "You automatically join it. Invite the agents/subagents you want with chat_invite. The room id is the " +
       "lowercased name slug; creation fails if that id already exists.",
     args: {
       name: z.string().describe('Short room name, e.g. "auth-refactor"'),
@@ -435,7 +440,8 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_room_list = tool({
     description:
-      "List all chat rooms in this project: name, purpose, members, message count, last message, " +
+      "List all chat rooms in this project (available to your agent/subagent session): name, purpose, " +
+      "members, message count, last message, " +
       "and your unread count. Also shows rooms you have been invited to. Join with chat_room_join.",
     args: {},
     execute: async (_args, ctx) => {
@@ -466,7 +472,7 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_room_join = tool({
     description:
-      "Join a chat room (by id or name). Accepts any pending invitation for you. " +
+      "Join a chat room (by id or name) as this agent/subagent. Accepts any pending invitation for you. " +
       "Returns any messages you have not read.",
     args: {
       room: z.string().describe("Room id or name (see chat_room_list)"),
@@ -501,8 +507,8 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_invite = tool({
     description:
-      "Invite other agents to a room you are a member of. Invited agents see the invitation in " +
-      "chat_room_list and accept it by calling chat_room_join. Use chat_agents to find agent names.",
+      "Invite other agents or subagents to a room you are a member of. Invited agents/subagents see the " +
+      "invitation in chat_room_list and accept it by calling chat_room_join. Use chat_agents to find agent names.",
     args: {
       room: z.string().describe("Room id or name"),
       agents: z.array(z.string()).describe("Chat names of agents to invite (see chat_agents)"),
@@ -550,7 +556,8 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_post = tool({
     description:
-      "Post a message to a chat room you are a member of. All members see it when they chat_read the room. " +
+      "Post a message to a chat room you are a member of. All members (agents and subagents) see it when " +
+      "they chat_read the room. " +
       "Use for coordination: progress notes, requests, findings, handoffs.",
     args: {
       room: z.string().describe("Room id or name"),
@@ -576,7 +583,8 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
 
   const chat_read = tool({
     description:
-      "Read a chat room's messages. By default returns only messages you have not read yet; " +
+      "Read a chat room's messages (as this agent/subagent). By default returns only messages you have " +
+      "not read yet; " +
       "pass include_read=true to reread the full retained history. Marks them read so the next " +
       "call only shows new ones.",
     args: {
@@ -642,10 +650,10 @@ export default (async ({ client, worktree }: { client: any; worktree: string }) 
     "experimental.chat.system.transform": async (input: { sessionID?: string }, output: { system: string[] }) => {
       const lines = [
         "# Agent coordination (agentchat)",
-        "Chat tools are available so agents working on this project can coordinate instead of working blind:",
-        "- chat_agents: directory of every agent, its unique name, and what it is doing.",
+        "Chat tools are available so agents and subagents working on this project can coordinate instead of working blind:",
+        "- chat_agents: directory of every agent/subagent, its unique name, live/exited status, and what it is doing.",
         "- chat_room_create(name, purpose) / chat_room_list / chat_room_join: project chat rooms by topic.",
-        "- chat_invite(room, agents): pull other agents into your room.",
+        "- chat_invite(room, agents): pull other agents/subagents into your room.",
         "- chat_post / chat_read: exchange messages in rooms you are a member of.",
         "- chat_status(status): publish what you are doing so others can see it.",
         "- chat_register(name): claim or check your unique chat name.",

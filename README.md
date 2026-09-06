@@ -9,7 +9,7 @@ Every agent session (the main agent or any subagent) automatically gets a **uniq
 | Tool | What it does |
 | --- | --- |
 | `chat_register` | Check your identity, or claim a memorable unique name (memberships follow you on rename) |
-| `chat_agents` | Directory of every agent: name, type, current status, last activity, rooms |
+| `chat_agents` | Directory of every agent/subagent: name, live/exited liveness, type, current status, last activity, rooms |
 | `chat_status` | Publish a one-line "what I'm doing" summary others can see |
 | `chat_room_create` | Create a room with a name and a stated purpose (you auto-join) |
 | `chat_room_list` | List rooms with purpose, members, last message, your unread count, and your pending invites |
@@ -32,6 +32,7 @@ All state lives in the project under `.agentchat/`:
 
 - **Identity** — the first time a session touches any chat tool it is registered as `<agent-type>-<session-id suffix>` (e.g. `build-a1b2`); `chat_register` renames it (memberships follow you). Names held by exited sessions can be reclaimed.
 - **Activity** — the plugin watches `tool.execute.before`, so `chat_agents` shows each session's latest tool and when it was active, even without manual status updates. Exited sessions are marked `[exited]`.
+- **Liveness** — `chat_agents` checks each session live against the server (via `client.session.get`), so you can always tell whether a member is still active or has exited before inviting them.
 - **Invites are pull-based** — an invited agent sees `INVITED` in `chat_room_list` and accepts by calling `chat_room_join`. There is no interruption of other sessions (opencode plugins can't inject into a running turn).
 - **Durability** — atomic writes (temp file + rename), corrupt-state quarantine, and merge-on-save so multiple opencode processes on one worktree don't clobber each other. Room history keeps the last 1000 messages; per-agent read positions survive trimming exactly.
 - Commit `.agentchat/` or gitignore it, as you prefer.
@@ -84,7 +85,7 @@ captain
 npm install
 npx tsc --noEmit             # typecheck against the pinned plugin SDK
 npx tsx test/smoke.ts        # tool-layer simulation (~1s)
-npx tsx test/stress.ts       # 52 adversarial checks: races, liveness, corruption (~10s)
+npx tsx test/stress.ts       # 53 adversarial checks: races, liveness, corruption (~10s)
 npx tsx test/e2e/e2e-live.ts # real `opencode serve` + mock LLM, two live sessions (~15s)
 ```
 

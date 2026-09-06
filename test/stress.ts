@@ -347,7 +347,10 @@ async function secLiveness() {
   ctrl.alive.delete(sess.vic)
 
   const agentsOut = await I1.exec("chat_agents", {}, c("prim", "build"))
-  check("04a", "dead session shown as [exited] in chat_agents", /zombie.*\[exited\]/.test(agentsOut), agentsOut)
+  check("04a", "dead session live-opts out of chat_agents with liveness: exited",
+    /- zombie \[type: vic\]\n\s+liveness: exited/.test(agentsOut), agentsOut)
+  const aliveEntry = (agentsOut.match(/- prim \[type: build\]\n\s+liveness: ([^\n]+)/) || [])[1] || ""
+  check("04a2", "live session shows liveness: alive in chat_agents", /alive/.test(aliveEntry), aliveEntry)
 
   const invDead = await I1.exec("chat_invite", { room: "pub", agents: ["zombie"] }, c("prim", "build"))
   check("04b", "chat_invite to exited session rejects with 'session has exited'",
@@ -362,12 +365,14 @@ async function secLiveness() {
     `out=${reclaim} members=${JSON.stringify(lounge.members)}`)
 
   const agentsOut2 = await I1.exec("chat_agents", {}, c("prim", "build"))
-  const thrEntry = (agentsOut2.match(/- thrower [^\n]*\n\s+doing: ([^\n]+)/) || [])[0] || ""
-  const thrDoing = (thrEntry.match(/doing: (.*)/) || [])[1] || ""
+  const thrEntry = agentsOut2.split("\n").find((l) => l.startsWith("- thrower")) || ""
+  const thrBlock = agentsOut2.split("- thrower")[1] ?? ""
+  const thrLiveness = (thrBlock.match(/liveness: ([^\n]+)/) || [])[1] || ""
+  const thrDoing = (thrBlock.match(/doing: ([^\n]+)/) || [])[1] || ""
   const invThr = await I1.exec("chat_invite", { room: "dock", agents: ["thrower"] }, c("prim", "build"))
-  check("04d", "client that THROWS fails open: no [exited], 'idle', invite succeeds",
-    !!thrEntry && !/\[exited\]/.test(thrEntry) && thrDoing === "idle" && /Invited: thrower/.test(invThr),
-    `entry="${thrEntry}" invite=${invThr}`)
+  check("04d", "client that THROWS fails open: liveness alive, 'idle', invite succeeds",
+    !!thrEntry && thrLiveness === "alive" && thrDoing === "idle" && /Invited: thrower/.test(invThr),
+    `entry="${thrEntry}" liveness="${thrLiveness}" doing="${thrDoing}" invite=${invThr}`)
 
   // [05] session.deleted pruning, shared via disk between instances
   await I1.event({ type: "session.deleted", properties: { info: { id: sess.gon } } })
@@ -383,11 +388,13 @@ async function secLiveness() {
   await I1.exec("chat_status", { status: "back" }, c("gon", "gone"))
   const agentsI1 = await I1.exec("chat_agents", {}, c("prim", "build"))
   const agentsI1b = await I2.exec("chat_agents", {}, c("rec", "rec"))
-  const goneLine1 = agentsI1.split("\n").find((l) => l.includes(goneName)) || ""
-  const goneLine2 = agentsI1b.split("\n").find((l) => l.includes(goneName)) || ""
-  check("05c", "session.deleted marks deadCache: instance1 keeps [exited] forever (alive client), instance2 sees alive",
-    /\[exited\]/.test(goneLine1) && !!goneLine2 && !/\[exited\]/.test(goneLine2),
-    `i1="${goneLine1}" i2="${goneLine2}"`)
+  const goneLine1 = agentsI1.split("- ").find((l) => l.startsWith(goneName)) || ""
+  const goneLine2 = agentsI1b.split("- ").find((l) => l.startsWith(goneName)) || ""
+  const goneLiveness1 = (goneLine1.split("\n")[1] ?? "").trim()
+  const goneLiveness2 = (goneLine2.split("\n")[1] ?? "").trim()
+  check("05c", "session.deleted marks deadCache: instance1 keeps exited forever (alive client), instance2 sees alive",
+    goneLiveness1.includes("exited") && !!goneLine2 && goneLiveness2.includes("alive"),
+    `i1="${goneLine1.split("\n")[0]} ${goneLiveness1}" i2="${goneLine2.split("\n")[0]} ${goneLiveness2}"`)
 
   await I2.event({ type: "session.deleted", properties: { info: { id: sess.gn2 } } })
   const gone2Name = "gone2-" + sess.gn2.slice(-4)
