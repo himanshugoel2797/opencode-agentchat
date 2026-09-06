@@ -43,5 +43,11 @@ writing the analysis to `test/FINDINGS-STRESS.md`. After an opencode version
 bump: bump `@opencode-ai/plugin` in `package.json`, typecheck, run e2e-live
 (proves the §6 live surfaces), update the §6 verification table.
 
+Unit tests CANNOT prove `chat_spawn` works (dry-run path only). Any change to
+spawn, zellij, or opencode-argv handling must additionally be verified LIVE:
+drive `opencode run` to call `chat_spawn`, confirm a tab opens, the worker
+registers under `AGENTCHAT_NAME`, posts to the room, and `chat_agents` shows
+it alive (see §6 G2/G4 for the traps this caught).
+
 Commit directly to `main` and `git push`; tag releases with `gh release
 create` (see §9). Update README.md user-facing behavior in the same commit.

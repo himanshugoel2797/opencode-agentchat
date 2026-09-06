@@ -18,6 +18,7 @@
 
 import * as fs from "node:fs"
 import * as path from "node:path"
+import { execFile } from "node:child_process"
 import type { Plugin, ToolContext } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 
@@ -810,15 +811,37 @@ export default (async ({ client, worktree, $ }: { client: any; worktree: string;
         (args.prompt && args.prompt.trim()) ||
         `Act as the persistent project worker registered as "${name}". Use the chat tools (chat_room_list, chat_room_join, chat_status, chat_post, chat_read) to coordinate; stay available to take tasks.`
       const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
-      const inner = `cd -- ${shq(worktree)} && AGENTCHAT_NAME=${shq(name)}${room ? ` AGENTCHAT_ROOM=${shq(room.id)}` : ""} exec opencode ${shq(prompt)}`
-      const cmd = `zellij action new-tab --name ${shq(name)} -- zsh -lc ${shq(inner)}`
+      // Real zellij+opencode surface (verified live on opencode 1.18.29 /
+      // zellij 0.44.3): the TUI positional arg is a PROJECT PATH, not a
+      // message — pass the initial instruction via `--prompt`, and export the
+      // identity vars so the interactive session (which IS the worker)
+      // registers under them. `run; exec tui` handoffs proved flaky; one
+      // process, one tab, stays open afterwards.
+      const envExports = `export AGENTCHAT_NAME=${shq(name)}${room ? ` AGENTCHAT_ROOM=${shq(room.id)}` : ""}`
+      const inner = `cd -- ${shq(worktree)} && ${envExports}; exec opencode . --prompt ${shq(prompt)}`
+      // execFile does NOT shell-parse argv elements: pass RAW tokens. shq is
+      // only meaningful for values embedded INSIDE the zsh script (`inner`),
+      // which zsh itself parses. (Passing shq'd tokens in argv made zsh exec a
+      // literal quoted string as the program name — pane died instantly.)
+      const argv = ["zellij", "action", "new-tab", "--name", name, "--", "zsh", "-lc", inner]
+      const cmdText = `zellij action new-tab --name ${shq(name)} -- zsh -lc ${shq(inner)}`
       if (!shellHandle) {
-        return `[dry-run: this process has no inline zellij runner]\nwould run: ${cmd}`
+        return `[dry-run: this process has no inline zellij runner]\nwould run: ${cmdText}`
       }
-      const out = await shellHandle.nothrow().quiet().cwd(worktree)`${cmd}`
-      if (out?.exitCode && out.exitCode !== 0) {
-        const err = String(out.stderr?.toString?.() ?? "").slice(0, 500)
-        return `zellij failed (exit ${out.exitCode}): ${err}`
+      // Deliberately NOT BunShell ($`...`): a string substituted into Bun
+      // Shell's command position becomes ONE argv element ("command not found:
+      // <whole string>"), and its rejection carries a Buffer stderr, not a
+      // callable. execFile with an argv array has no shell-parsing surface at
+      // all; `shellHandle`'s presence only serves as a "real opencode host"
+      // sentinel so headless test harnesses keep the dry-run path.
+      try {
+        await new Promise<void>((resolve, reject) => {
+          execFile(argv[0], argv.slice(1), { cwd: worktree }, (err) => (err ? reject(err) : resolve()))
+        })
+      } catch (e: any) {
+        const code = typeof e?.code === "number" ? e.code : 1
+        const errText = String(e?.stderr ?? e?.message ?? "").slice(0, 500).trim()
+        return `zellij failed (exit ${code}): ${errText}`
       }
       const head = `Spawned persistent worker "${name}" in a new zellij tab. It registers under AGENTCHAT_NAME on its first chat tool use.${room ? ` Auto-joined room "${room.id}".` : ""}`
       return `${head}\nTalk to it with chat_post / chat_read; watch it in chat_agents.`

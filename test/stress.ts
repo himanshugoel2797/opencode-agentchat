@@ -431,12 +431,14 @@ async function secSpawn() {
   await I1.exec("chat_register", { name: "host" }, host)
   await I1.exec("chat_room_create", { name: "ops", purpose: "ops room" }, host)
 
+  const prev = { NAME: process.env.AGENTCHAT_NAME, ROOM: process.env.AGENTCHAT_ROOM, Z: process.env.ZELLIJ }
+  if (process.env.ZELLIJ !== undefined) delete process.env.ZELLIJ
   const noZ = await I1.exec("chat_spawn", { name: "worker1", room: "ops" }, host)
   check("SP1", "chat_spawn outside zellij is refused",
     /requires zellij/.test(noZ), noZ)
-
-  const prev = { NAME: process.env.AGENTCHAT_NAME, ROOM: process.env.AGENTCHAT_ROOM }
   try {
+    if (process.env.AGENTCHAT_NAME !== undefined) delete process.env.AGENTCHAT_NAME
+    if (process.env.AGENTCHAT_ROOM !== undefined) delete process.env.AGENTCHAT_ROOM
     process.env.AGENTCHAT_NAME = "worker1"
     process.env.AGENTCHAT_ROOM = "ops"
     const w = "ses_spawn_w1_0002"
@@ -474,15 +476,17 @@ async function secSpawn() {
         /\[dry-run/.test(dry),
       dry.slice(0, 200))
     check("SP3b", "dry-run (no inline runner) exposes the exact zellij+env command",
-      new RegExp(`zellij action new-tab --name '${ghostName}'`).test(dry) && /AGENTCHAT_NAME=/.test(dry) &&
-        /AGENTCHAT_ROOM=.*ops/.test(dry) && /exec opencode/.test(dry),
+      new RegExp(`zellij action new-tab --name '${ghostName}' -- zsh -lc`).test(dry) && /AGENTCHAT_NAME=/.test(dry) &&
+        /AGENTCHAT_ROOM=.*ops/.test(dry) &&
+        /export AGENTCHAT_NAME=/.test(dry) && /exec opencode \. --prompt/.test(dry),
       dry.slice(0, 300))
 
     const took = await I2.exec("chat_spawn", { name: "worker1" }, host)
     check("SP3c", "spawn refuses a name held by a live agent",
       /held by a live agent/.test(took), took)
   } finally {
-    delete process.env.ZELLIJ
+    if (prev.Z === undefined) delete process.env.ZELLIJ
+    else process.env.ZELLIJ = prev.Z
   }
 }
 
