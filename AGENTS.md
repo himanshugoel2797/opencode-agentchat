@@ -15,6 +15,9 @@ upgrade (§6).
   `mutateRoom`; every agent-record write through `saveRecord`. Message
   indices and read cursors are ABSOLUTE (`room.first` tracks trimming) —
   never adjust cursors on trim.
+- The state-root is the worktree, falling back to `directory` when opencode
+  reports `worktree === "/"` (non-git). Never key state on raw `worktree`, and
+  never write to `/`.
 - No dependency on `zod` imports: use `tool.schema` (zod v4 namespace, no
   nested `.z`). No build step: ship `index.ts` as-is.
 - The plugin must never prompt or inject into other sessions (pull-based
@@ -43,11 +46,13 @@ writing the analysis to `test/FINDINGS-STRESS.md`. After an opencode version
 bump: bump `@opencode-ai/plugin` in `package.json`, typecheck, run e2e-live
 (proves the §6 live surfaces), update the §6 verification table.
 
-Unit tests CANNOT prove `chat_spawn` works (dry-run path only). Any change to
-spawn, zellij, or opencode-argv handling must additionally be verified LIVE:
-drive `opencode run` to call `chat_spawn`, confirm a tab opens, the worker
-registers under `AGENTCHAT_NAME`, posts to the room, and `chat_agents` shows
-it alive (see §6 G2/G4 for the traps this caught).
+Unit tests CANNOT prove `chat_spawn` works (dry-run path only) or that the
+non-git state-root fallback (I10) holds. Any change to spawn, zellij,
+opencode-argv handling, or `PluginInput` root resolution must additionally be
+verified LIVE per MAINTENANCE §7a: drive `opencode run` to call `chat_spawn`,
+confirm a tab opens, the worker registers under `AGENTCHAT_NAME`, posts to the
+room, and `chat_agents` shows it alive; and run opencode in a non-git dir to
+confirm state lands in that directory, never `/`.
 
 Commit directly to `main` and `git push`; tag releases with `gh release
 create` (see §9). Update README.md user-facing behavior in the same commit.

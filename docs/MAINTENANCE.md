@@ -11,9 +11,12 @@ Gives every opencode agent session (primary agents and subagents) a unique
 chat identity and 10 tools (`chat_*`) to coordinate through project-scoped chat
 rooms. Liveness is lease-based (quiet ~2 min → considered exited), and
 `chat_spawn` starts persistent worker sessions in new zellij tabs. All state is
-plain JSON on disk under `<worktree>/.agentchat/`, shared by every opencode
-process opened on the same worktree. No network service, no database, no
-dependencies beyond `@opencode-ai/plugin`.
+plain JSON on disk under `<state-root>/.agentchat/`, shared by every opencode
+process opened on the same project. The **state-root** is
+`PluginInput.worktree`, except opencode reports `"/"` for non-git projects —
+then it falls back to `PluginInput.directory` (each opened dir keeps its own
+`.agentchat`; nothing is ever written to the filesystem root). No network
+service, no database, no dependencies beyond `@opencode-ai/plugin`.
 
 ## 2. File map
 
@@ -21,7 +24,7 @@ dependencies beyond `@opencode-ai/plugin`.
 | --- | --- |
 | `index.ts` | Entire plugin: types, state helpers, 10 tools, 3 hooks + heartbeat timer. Single file by design. |
 | `test/smoke.ts` | Tool-layer simulation: 3 fake agent sessions + fake `client` drive the real tool `execute` functions against a temp worktree. Fast (~1s). |
-| `test/stress.ts` | Adversarial stress/edge suite (60 checks): multi-instance races on one worktree, lease liveness/death lifecycle, `chat_spawn` guards + deterministic worker names, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~10s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). |
+| `test/stress.ts` | Adversarial stress/edge suite (62 checks): multi-instance races on one worktree, lease liveness/death lifecycle, `chat_spawn` guards + deterministic worker names + non-git state-root fallback, corrupt-state recovery, legacy-schema backfill, trim-boundary cursor arithmetic, path-traversal refs, limits, activity-cap. ~13s. XFAIL infrastructure exists for known-bad plugin behavior (none currently). **Cannot prove spawn actually spawns — see §7a.** |
 | `test/e2e/e2e-live.ts` | TRUE end-to-end: boots a mock OpenAI-compatible LLM + real `opencode serve` in a fully isolated env (`XDG_CONFIG_HOME` **and `HOME`** overridden — opencode loads legacy `~/.opencode` regardless of XDG; keep HOME fake), then drives two real sessions through scripted `tool_calls` and asserts on-disk state + tool outputs captured from SSE. ~11s warm / ~60s cold. See `test/e2e/FINDINGS.md`. |
 | `test/FINDINGS-STRESS.md`, `test/e2e/FINDINGS.md` | Bug reports from adversarial passes; keep as history + severity rationale. Both reported bugs are fixed (their checks are now hard assertions). |
 | `docs/MAINTENANCE.md` | This file. |
@@ -30,7 +33,7 @@ dependencies beyond `@opencode-ai/plugin`.
 
 ## 3. On-disk state schema
 
-### `<worktree>/.agentchat/agents.json`
+### `<state-root>/.agentchat/agents.json`
 
 Object keyed by **sessionID**:
 
@@ -49,7 +52,7 @@ Object keyed by **sessionID**:
 }
 ```
 
-### `<worktree>/.agentchat/rooms/<id>.json`
+### `<state-root>/.agentchat/rooms/<id>.json`
 
 `id` is the slug of the name: lowercase, non-alphanumeric runs → `-`.
 Punctuation-only names collapse to `"room"` (acceptable; collision then
@@ -124,6 +127,12 @@ a bug found in adversarial review of v0.1.0)
   never be written back outside `rooms/` (FINDINGS-STRESS Bug 2, regression
   check `09e`). Keep both guards; they are defense-in-depth against an
   attacker who can already write `.agentchat/`.
+- **I10 — the state-root is never `/`.** `PluginInput.worktree === "/"` (a
+  non-git project, verified live) must resolve state to
+  `PluginInput.directory`: separate non-git projects must not share
+  rooms/identities via a filesystem-root `.agentchat/`, nothing is ever
+  written to `/`, and `chat_spawn` cds into the same resolved root.
+  Regression checks `RF1`/`RF2`.
 
 ## 5. Tool contracts
 
@@ -138,7 +147,7 @@ a bug found in adversarial review of v0.1.0)
 | `chat_invite` | `room`, `agents[]` | Caller must be member. Per-target outcome lines. Rejects unknown names and exited sessions (I5). Invite recorded as a system message in the room. **Pull-based**: invitee must call `chat_room_join`; the plugin must never inject into other sessions' turns. |
 | `chat_post` | `room`, `message` | Caller must be member. 4000-char cap. Poster auto-marks the room read at their own message. |
 | `chat_read` | `room`, `include_read?` | Caller must be member. Default: unseen only; advances cursor as a side effect. `include_read` → retained history (subject to I1 trim). |
-| `chat_spawn` | `name`, `prompt?`, `room?` | Requires `$` presence (real-host sentinel) and `ZELLIJ` env; outside zellij → refusal string. Reclaims a stale name holder (I5 recheck + `purgeRecord`), refuses a lease-alive holder. Executes (via `execFile`, RAW argv tokens) `zellij action new-tab --name <n> -- zsh -lc "cd -- <wt> && export AGENTCHAT_NAME=<n> [AGENTCHAT_ROOM=<id>]; exec opencode . --prompt <p>"` — values inside the zsh script are `shq`-quoted, argv tokens are NOT. The worker claims its name/room deterministically in `ensureAgent` (`AGENTCHAT_ROOM` auto-joins via `maybeAutoJoin`). No `$` (test harness) → returns the exact `[dry-run]` command instead. Verified live end-to-end on opencode 1.18.29 + zellij 0.44.3. |
+| `chat_spawn` | `name`, `prompt?`, `room?` | Requires `$` presence (real-host sentinel) and `ZELLIJ` env; outside zellij → refusal string. Reclaims a stale name holder (I5 recheck + `purgeRecord`), refuses a lease-alive holder. Executes (via `execFile`, RAW argv tokens) `zellij action new-tab --name <n> -- zsh -lc "cd -- <state-root> && export AGENTCHAT_NAME=<n> [AGENTCHAT_ROOM=<id>]; exec opencode . --prompt <p>"` — values inside the zsh script are `shq`-quoted, argv tokens are NOT. The worker claims its name/room deterministically in `ensureAgent` (`AGENTCHAT_ROOM` auto-joins via `maybeAutoJoin`). No `$` (test harness) → returns the exact `[dry-run]` command instead. Verified live end-to-end on opencode 1.18.29 + zellij 0.44.3. |
 
 Room refs accept exact id, exact name, then case-insensitive name; failures
 list available rooms.
@@ -154,6 +163,7 @@ and this table, re-run §7, and note the change in git history.
 | A | Plugin loading | Default export is an async factory returning `Hooks`; `satisfies Plugin` compiles. Auto-discovered in `.opencode/plugins/*.ts` and global config dir. | `npx tsc --noEmit`; load it in a live opencode and check for load errors. |
 | B | `tool` hook keys = **raw tool ids** | `chat_post` reaches the model unprefixed (no `plugin_` namespace). Verified by inspecting the opencode binary's registry wiring (`Object.entries(…plugin.tool…)` uses keys verbatim; only MCP tools are prefixed `server_tool`). If a future version namespaces them, update every `chat_*` mention in descriptions and the §7 prompt block. | `grep -a "chat_post" $(which opencode)` is not conclusive — check in a live session: ask the agent to call `chat_room_list` with no args. |
 | C | `ToolContext` fields | `sessionID`, `agent`, `messageID`, `directory`, `worktree`, `abort`, `metadata`, `ask` exist on every tool execute. Identity is keyed on `sessionID`; display default is `<agent>-<sessionID suffix>`. | Typecheck against bumped SDK (`index.ts` imports `ToolContext`). |
+| C2 | `PluginInput` state root | Factory receives `{ client, worktree, directory, $ }`. **`worktree` is `"/"` for non-git projects** (verified live) — I10 fallback to `directory` must stay; a future version that fixes `worktree` itself is fine, the guard degrades to a no-op. | Live: `mkdir /tmp/x && cd /tmp/x && opencode` (no git) — state must land in `/tmp/x/.agentchat/`, never `/.agentchat`. Stress `RF1`/`RF2`. |
 | D | `tool.execute.before` | Fires for **plugin-defined tools too**, with `{tool, sessionID}` — this powers activity tracking. | Live session: call a chat tool, then `chat_agents` should show it as last activity. |
 | E | `experimental.chat.system.transform` | Signature `(input:{sessionID?,model}, output:{system})`; called on **every** chat request, including hidden agents (title/summary/compaction) and one agent-generation site **without sessionID** (guard exists — keep it). We also stamp the lease + classify self (primary vs sub) here, so the heartbeat works for sessions that only chat. `output.system` is rebuilt per request, so mutating per call does not accumulate. **Hard requirement:** never leave `output.system` with >1 entry — opencode emits each entry as its own `system`-role message, and SGLang/vLLM reject any `system` message that is not the first ("System message must be at the beginning."). Merge the block into `output.system[0]` (or push only when the array is empty), as the current impl does. | Typecheck; live: ask an agent "what is your chat name" — the prompt block must be reaching it. e2e-live asserts single-system-at-start on every mock request. If renamed/removed, move the guidance into tool descriptions only. |
 | F | `event` hook | Event payload shapes (verified in SDK `types.gen.d.ts`): `session.deleted` → `properties.info.id`; `session.status`/`session.idle` → `properties.sessionID`; `message.updated` → `properties.info.sessionID`; `message.part.updated` → `properties.part.sessionID`. We use the latter to **stamp the lease** (`eventSessionID` helper checks all four shapes — keep it updated if events are renamed), and `session.deleted` to prune the record permanently (deadCache). If event names/payloads change, leases stop extending via events (graceful; tool/system hooks still stamp). | Live: run any tool in another session; check `lastSeen` in `.agentchat/agents.json` moves. Delete a throwaway session, check its record vanishes from `agents.json` on next use. |
@@ -163,7 +173,7 @@ and this table, re-run §7, and note the change in git history.
 | G3 | `setInterval` heartbeat | Plugin process may outlive sessions; timer is `unref()`d and persists `lastSeen` + flushes `seen` every 30s. If the bun host freezes timers for idle plugins, leases expire too eagerly → `AGENTCHAT_STALE_MS` makes this testable. | Live: keep one session idle >2 min in a room, confirm `chat_agents` from another session still shows it alive after ~30s heartbeats. |
 | H | `tool.schema` | Is the zod **v4** classic namespace — call `z.string()` on it directly; there is **no nested `.z` export** and do not import `zod` separately (version skew). | Typecheck; smoke test. |
 | I | Tool result | Returning a plain string is a valid `ToolResult`. | Smoke test. |
-| J | State dir writable | `.agentchat/` is created lazily under `worktree`. Unwritable fs surfaces as a tool error — acceptable, don't add silent fallbacks. | Manual. |
+| J | State dir writable | `.agentchat/` is created lazily under the state-root (worktree, or `directory` for non-git per I10/C2). Unwritable fs surfaces as a tool error — acceptable, don't add silent fallbacks. | Manual. |
 
 ## 7. Regression harness (always run all three before pushing)
 
@@ -171,9 +181,37 @@ and this table, re-run §7, and note the change in git history.
 npm install
 npx tsc --noEmit          # types vs the pinned SDK
 npx tsx test/smoke.ts     # ~1s   tool-layer happy-path + trim/cursor basics
-npx tsx test/stress.ts    # ~10s  60 adversarial checks (races, lease liveness, spawn guards, corrupt, legacy, boundaries, refs)
+npx tsx test/stress.ts    # ~13s  62 adversarial checks (races, lease liveness, spawn guards + root-fallback, corrupt, legacy, boundaries, refs)
 npx tsx test/e2e/e2e-live.ts   # ~11s warm / ~60s cold — REAL opencode serve + scripted mock LLM
 ```
+
+### 7a. What the automated suites CANNOT prove (mandatory manual checks)
+
+Unit/stress suites inject a fake `client` and **omit `$` (BunShell)**, so
+`chat_spawn` takes its `[dry-run]` branch: they verify the emitted command
+*shape* and the guards, never that a tab actually opens or a worker registers.
+Likewise no suite exercises a real zellij, a non-git `worktree="/"`, or the
+`opencode . --prompt` argv contract. **After ANY change to spawn/zellij/argv/
+`PluginInput` handling — or before tagging a release that touched them — run
+the LIVE spawn check:**
+
+1. From inside a real zellij session, in the repo, drive a throwaway session:
+   `opencode run 'call chat_spawn name=live-worker-1 room=<x> prompt="<join
+   room, post a marker, set status>"'`.
+2. Confirm ALL of: a new zellij tab opens (`zellij action list-tabs` shows it);
+   the tab's process is `opencode . --prompt ...` (`ps -eo ppid,args |
+   awk '$1==<server>'`), it **stays alive**; `.agentchat/agents.json` gains a
+   `live-worker-1` record via `AGENTCHAT_NAME`; the marker message appears in
+   the room file; `chat_agents` (from your own session) lists `live-worker-1`
+   as **alive**. Finished `opencode run` drivers must show **exited**.
+3. Close the spawned tabs (`zellij action go-to-tab-by-id N; close-tab`) and
+   prune the test records so shared state isn't polluted.
+
+Three real blockers were caught ONLY by this live loop (v0.3.1): BunShell
+argv[0] misuse, `shq`-quoting leaking into `execFile` argv (instant pane
+death), and the TUI positional being `[project]` not the message. Trust the
+live check over green suites for these surfaces. Also do the non-git C2 check
+(`mkdir /tmp/x && cd /tmp/x && opencode` → state under `/tmp/x`, never `/`).
 
 `test/smoke.ts` fakes only the opencode surface (`ToolContext` +
 `client.session.get`). Assertions cover: uniqueness refusal, invite/join/
@@ -199,7 +237,9 @@ for plugin tools), E (system prompt block reaches sessions), G
   provider wire format, this harness fails FIRST — that is by design.
 - If plugin discovery regresses upstream, note: dir-symlinks under
   `.opencode/plugins/` are NOT discovered (only direct file symlinks were);
-  the project must be `git init`ed or `worktree` resolves to `/`.
+  `worktree` resolves to `/` unless the project is `git init`ed (the plugin
+  falls back to `directory` per I10/C2 — keep it that way so non-git projects
+  still work).
 
 Manual live check if e2e-live can't run (no `opencode` binary available):
 see git history of this section (pre-0.2 checklist).

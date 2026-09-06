@@ -65,8 +65,12 @@ const STALE_MS = 120_000 // quiet this long -> lease expires, listed as exited
 const HEARTBEAT_MS = 30_000 // persistent sessions re-stamp themselves
 const SEEN_MAX = 400
 
-export default (async ({ client, worktree, $ }: { client: any; worktree: string; $?: any }) => {
-  const root = path.join(worktree, ".agentchat")
+export default (async ({ client, worktree, directory, $ }: { client: any; worktree: string; directory?: string; $?: any }) => {
+  // opencode resolves worktree to "/" for non-git projects. Fall back to the
+  // session's directory so each project keeps its own .agentchat (instead of
+  // sharing/failing on a root-level one), and chat_spawn cds somewhere sane.
+  const base = worktree && worktree !== "/" ? worktree : directory || worktree
+  const root = path.join(base, ".agentchat")
   const roomsDir = path.join(root, "rooms")
   const shellHandle = $ ?? undefined
 
@@ -818,7 +822,7 @@ export default (async ({ client, worktree, $ }: { client: any; worktree: string;
       // registers under them. `run; exec tui` handoffs proved flaky; one
       // process, one tab, stays open afterwards.
       const envExports = `export AGENTCHAT_NAME=${shq(name)}${room ? ` AGENTCHAT_ROOM=${shq(room.id)}` : ""}`
-      const inner = `cd -- ${shq(worktree)} && ${envExports}; exec opencode . --prompt ${shq(prompt)}`
+      const inner = `cd -- ${shq(base)} && ${envExports}; exec opencode . --prompt ${shq(prompt)}`
       // execFile does NOT shell-parse argv elements: pass RAW tokens. shq is
       // only meaningful for values embedded INSIDE the zsh script (`inner`),
       // which zsh itself parses. (Passing shq'd tokens in argv made zsh exec a
@@ -836,7 +840,7 @@ export default (async ({ client, worktree, $ }: { client: any; worktree: string;
       // sentinel so headless test harnesses keep the dry-run path.
       try {
         await new Promise<void>((resolve, reject) => {
-          execFile(argv[0], argv.slice(1), { cwd: worktree }, (err) => (err ? reject(err) : resolve()))
+          execFile(argv[0], argv.slice(1), { cwd: base }, (err) => (err ? reject(err) : resolve()))
         })
       } catch (e: any) {
         const code = typeof e?.code === "number" ? e.code : 1

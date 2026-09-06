@@ -65,8 +65,8 @@ function makeClient(delayMs = 0) {
 }
 type Ctrl = ReturnType<typeof makeClient>
 
-async function makeInst(worktree: string, client: any) {
-  const hooks = (await AgentChat({ worktree, client } as never)) as unknown as Record<string, any>
+async function makeInst(worktree: string, client: any, inputExtra?: Record<string, unknown>) {
+  const hooks = (await AgentChat({ worktree, client, ...(inputExtra || {}) } as never)) as unknown as Record<string, any>
   const tools = hooks.tool as Record<string, { execute: Exec }>
   return {
     tools,
@@ -490,6 +490,37 @@ async function secSpawn() {
   }
 }
 
+// ================================================= section root fallback:
+// non-git project (PluginInput.worktree === "/") must fall back to directory
+async function secRootFallback() {
+  console.log("\n--- section ROOT-FALLBACK ---")
+  const wt = mkwt("rootfb")
+  const ctrl = makeClient()
+  const rootExistedBefore = fs.existsSync("/.agentchat")
+  const I = await makeInst("/", ctrl.client, { directory: wt })
+  const ctx = makeCtx(wt)
+  const s = "ses_rootfb_0001"
+  ctrl.alive.add(s)
+  const c = ctx(s, "build")
+  const out = await I.exec("chat_status", { status: "rooted" }, c)
+  check("RF1", "worktree='/' falls back to directory for state (no /.agentchat)",
+    /Status updated/.test(out) && !!readAgents(wt)[s] &&
+      fs.existsSync("/.agentchat") === rootExistedBefore,
+    `out=${out.slice(0, 80)}`)
+  const prevZ = process.env.ZELLIJ
+  process.env.ZELLIJ = "1"
+  try {
+    const dry = await I.exec("chat_spawn", { name: "rootfb-worker" }, c)
+    const esc = (s: string) => s.replace(/'/g, `'\\''`) // quotes inside `inner` render escaped in the dry-run display
+    check("RF2", "chat_spawn cds into the fallback directory, not the filesystem root",
+      dry.includes("cd -- " + esc(`'${wt}'`)) && !dry.includes("cd -- " + esc("'/'")),
+      dry.slice(0, 200))
+  } finally {
+    if (prevZ === undefined) delete process.env.ZELLIJ
+    else process.env.ZELLIJ = prevZ
+  }
+}
+
 // ====================================================== section register race:
 // concurrent reclaim of a dead-held name from 2 instances (req. 3)
 async function secRegRace() {
@@ -841,7 +872,8 @@ async function main() {
   await secRace()
   await secLimits()
   await secLiveness()
-  await secSpawn()
+    await secSpawn()
+  await secRootFallback()
   await secRegRace()
   await secCorrupt()
   await secLegacy()
